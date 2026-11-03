@@ -8,6 +8,7 @@
 - Сборка и `.dmg`: `./venice-chat/macapp/build.sh` (сначала `osascript -e 'quit app "И ВСЕ 3,14здец"'`).
 - Самотест: `VENICE_SELFTEST=1 "$HOME/Applications/И ВСЕ 3,14здец.app/Contents/MacOS/VeniceChat"`;
   агент: добавь `VENICE_AGENTTEST="задание"`.
+- Обновления: подними `macapp/VERSION`, `./venice-chat/macapp/build.sh release`, zip → GitHub Release с тегом `v<версия>`.
 - Не переименовывать bundle id `local.venice.chat`, файл `VeniceChat`, папку данных `VeniceChat`.
 - В `venice-chat/.env` — API-ключ владельца; он вшивается в сборку. Не публиковать.
 - После тестов удаляй свои тестовые чаты и проекты; говори, сколько стоили запросы к Venice.

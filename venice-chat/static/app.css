@@ -471,3 +471,17 @@ a.file-card:hover { border-color: var(--faint); }
 .steps-more summary::-webkit-details-marker { display: none; }
 .step.note { font-style: italic; color: var(--faint); }
 .step.note .step-text { white-space: normal; }
+
+/* ---------- Уведомление об обновлении (снизу слева) ---------- */
+#updateCard { position: fixed; left: 16px; bottom: 16px; width: 300px; max-width: calc(100vw - 32px); background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 14px 16px; z-index: 70; font-size: 14px; opacity: 0; transform: translateY(12px); transition: opacity .25s, transform .25s; }
+#updateCard.show { opacity: 1; transform: translateY(0); }
+#updateCard .u-head { display: flex; align-items: center; gap: 8px; font-weight: 650; margin-bottom: 4px; }
+#updateCard .u-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+#updateCard .u-sub { color: var(--muted); line-height: 1.4; }
+#updateCard details { margin-top: 8px; color: var(--muted); }
+#updateCard summary { cursor: pointer; font-size: 13px; }
+#updateCard .u-notes { white-space: pre-wrap; max-height: 140px; overflow: auto; margin-top: 6px; font-size: 13px; line-height: 1.45; }
+#updateCard .u-actions { display: flex; gap: 8px; margin-top: 12px; }
+#updateCard .u-actions button[disabled] { opacity: .6; cursor: default; }
+#updateCard .u-err { color: var(--danger); margin-top: 8px; font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { #updateCard { transition: none; } }

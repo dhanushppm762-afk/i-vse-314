@@ -2329,3 +2329,56 @@ async function importLegacyHistory() {
   await loadModels();
   $("#input").focus();
 })();
+
+// ================= Обновления (только приложение для Mac) =================
+// Приложение спрашивает GitHub о новом релизе; если он есть — карточка снизу слева.
+// «Позже» прячет карточку для этой версии до следующего запуска; «Обновить» скачивает и перезапускает.
+async function checkForUpdates(manual = false) {
+  let info;
+  try { info = await api.json("/api/update" + (manual ? "?force=1" : "")); }
+  catch { if (manual) toast("Проверка обновлений есть только в приложении для Mac"); return; }
+  if (!info.available) {
+    if (manual) toast(info.error ? `Не удалось проверить: ${info.error}` : `У вас последняя версия (${info.current})`);
+    return;
+  }
+  if (!manual && sessionStorage.getItem("updateLater") === info.latest) return;
+  showUpdateCard(info);
+}
+window.checkForUpdates = checkForUpdates;
+
+function showUpdateCard(info) {
+  let card = $("#updateCard");
+  if (!card) { card = document.createElement("div"); card.id = "updateCard"; card.setAttribute("role", "status"); document.body.appendChild(card); }
+  const notes = (info.notes || "").trim();
+  card.innerHTML = `<div class="u-head"><span class="u-dot"></span>Доступно обновление ${esc(info.latest)}</div>
+    <div class="u-sub">У вас версия ${esc(info.current)}. Чаты и настройки сохранятся.</div>
+    ${notes ? `<details><summary>Что нового</summary><div class="u-notes">${esc(notes)}</div></details>` : ""}
+    <div class="u-actions"><button type="button" class="primary" data-act="install">Обновить</button><button type="button" class="btn" data-act="later">Позже</button></div>
+    <div class="u-err" hidden></div>`;
+  requestAnimationFrame(() => card.classList.add("show"));
+  card.onclick = async e => {
+    const act = e.target.closest("button")?.dataset.act;
+    if (act === "later") {
+      sessionStorage.setItem("updateLater", info.latest);
+      card.classList.remove("show");
+      setTimeout(() => card.remove(), 300);
+    }
+    if (act === "install") {
+      if (S.stream) return toast("Дождитесь окончания ответа");
+      const btn = e.target.closest("button"), err = $(".u-err", card);
+      btn.disabled = true; btn.textContent = "Скачиваю…"; err.hidden = true;
+      try {
+        const r = await fetch("/api/update", { method: "POST" });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || r.status);
+        btn.textContent = "Перезапускаю…";
+      } catch (x) {
+        btn.disabled = false; btn.textContent = "Обновить";
+        err.textContent = x.message; err.hidden = false;
+      }
+    }
+  };
+}
+
+setTimeout(() => checkForUpdates(), 4000);
+setInterval(() => checkForUpdates(), 6 * 60 * 60 * 1000);
