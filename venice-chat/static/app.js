@@ -2382,3 +2382,14 @@ function showUpdateCard(info) {
 
 setTimeout(() => checkForUpdates(), 4000);
 setInterval(() => checkForUpdates(), 6 * 60 * 60 * 1000);
+
+// Версия приложения и ручная проверка обновлений — в Настройках → «Основные»
+(async () => {
+  try {
+    const c = await api.json("/api/config");
+    if (!c.app || !c.version) return;
+    $("#appVersionText").textContent = `Версия ${c.version}`;
+    $("#appVersion").hidden = false;
+    $("#checkUpdatesBtn").onclick = () => checkForUpdates(true);
+  } catch {}
+})();
