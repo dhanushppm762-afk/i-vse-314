@@ -1,0 +1,7 @@
+.env
+*.env
+.DS_Store
+build/
+*.dmg
+*.app/
+key.txt

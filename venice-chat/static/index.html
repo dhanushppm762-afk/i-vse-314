@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>И ВСЕ 3,14здец</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link id="hlLight" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" media="(prefers-color-scheme: light)">
+<link id="hlDark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="app.css">
+<script>try { const t = JSON.parse(localStorage.getItem("settings") || "{}").theme; if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-head">
+      <div class="brand"><span class="logo"></span><span class="brand-name">И ВСЕ 3,14здец</span></div>
+      <button class="icon-btn" id="collapseBtn" title="Скрыть панель">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+      </button>
+    </div>
+    <button id="newChat" class="new-chat">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Новый чат
+    </button>
+    <div class="search">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
+      <input id="search" placeholder="Поиск чатов">
+    </div>
+    <div class="side-scroll">
+      <div class="side-title">
+        <span>Проекты</span>
+        <button class="icon-btn" id="newProject" title="Новый проект">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <div id="projectList"></div>
+      <div class="side-title"><span>Чаты</span></div>
+      <nav id="chatList"></nav>
+    </div>
+    <div class="side-foot">
+      <button id="settingsBtn" class="side-btn">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        Настройки
+      </button>
+    </div>
+  </aside>
+  <div id="scrim"></div>
+
+  <main>
+    <header class="topbar">
+      <button class="icon-btn" id="expandBtn" title="Показать панель">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+      </button>
+      <button class="icon-btn" id="newChatTop" title="Новый чат">
+        <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4z"/></svg>
+      </button>
+      <div id="chatTitle"></div>
+      <button class="icon-btn" id="browserBtn" title="Показать или скрыть браузер (Cmd+B)" hidden>
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M15 4v16"/></svg>
+      </button>
+      <select id="chatProject" class="mini" title="Проект, к которому относится этот чат" hidden></select>
+    </header>
+
+    <div id="scroll"><div id="thread"></div></div>
+
+    <div class="composer-wrap">
+      <div id="composer">
+        <div id="attachBar"></div>
+        <textarea id="input" rows="1" placeholder="Напишите сообщение…"></textarea>
+        <div class="composer-row">
+          <button id="attach" class="icon-btn" title="Прикрепить файлы (можно перетащить или вставить)">
+            <svg viewBox="0 0 24 24"><path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg>
+          </button>
+          <div class="modes" id="modes">
+            <button type="button" data-mode="chat" title="Обычный чат с моделью">
+              <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-11.8 7L4 20l1-4.2A8 8 0 1 1 20 12z"/></svg><span>Чат</span>
+            </button>
+            <button type="button" data-mode="image" title="Создать картинку по описанию">
+              <svg viewBox="0 0 24 24"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg><span>Картинка</span>
+            </button>
+            <button type="button" data-mode="edit" title="Изменить фото по описанию">
+              <svg viewBox="0 0 24 24"><path d="M15 4l5 5L9 20H4v-5z"/><path d="M12.5 6.5l5 5"/></svg><span>Редактор</span>
+            </button>
+          </div>
+          <button id="webBtn" class="toggle" title="Разрешить модели искать в интернете">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+            <span>Поиск</span>
+          </button>
+          <button id="agentBtn" class="toggle" title="Модель сама работает в браузере: открывает сайты, читает, нажимает" hidden>
+            <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/><path d="M10.5 13l3 2-3 2z"/></svg>
+            <span>Браузер</span>
+          </button>
+          <div class="spacer"></div>
+          <select id="aspect" class="mini" title="Соотношение сторон" hidden></select>
+          <select id="resolution" class="mini" title="Разрешение" hidden></select>
+          <select id="model" title="Модель"></select>
+          <button id="send" class="send" title="Отправить"></button>
+        </div>
+      </div>
+      <div class="hint">Enter — отправить · Shift+Enter — новая строка · Esc — остановить</div>
+    </div>
+  </main>
+</div>
+
+<input type="file" id="fileInput" multiple hidden>
+<input type="file" id="projectFileInput" multiple hidden>
+<div id="drop"><div>Отпустите, чтобы прикрепить файлы</div></div>
+<div id="toast"></div>
+<div id="lightbox" hidden><img alt=""><button class="icon-btn lb-close" title="Закрыть (Esc)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+
+<dialog id="settings">
+  <form method="dialog">
+    <div class="dlg-head">
+      <h2>Настройки</h2>
+      <div class="seg" id="settingsTabs">
+        <button type="button" data-tab="general" class="on">Основные</button>
+        <button type="button" data-tab="usage">Использование</button>
+      </div>
+    </div>
+    <div class="tab-pane" data-pane="general">
+    <div class="field">
+      <span>Оформление</span>
+      <div class="seg" id="themeSeg">
+        <button type="button" data-theme-val="system">Как в системе</button>
+        <button type="button" data-theme-val="light">Светлая</button>
+        <button type="button" data-theme-val="dark">Тёмная</button>
+      </div>
+    </div>
+    <label class="field">
+      <span>Системный промпт <small>— инструкция модели для всех чатов</small></span>
+      <textarea id="setSystem" rows="6" placeholder="Например: отвечай кратко и по-русски"></textarea>
+    </label>
+    <label class="field">
+      <span>Температура: <b id="tempValue">по умолчанию</b> <small>— выше = креативнее</small></span>
+      <div class="row"><input type="range" id="setTemp" min="0" max="2" step="0.1"><button type="button" id="tempReset" class="link">сбросить</button></div>
+    </label>
+    <div class="field">
+      <span>Аккаунт Venice</span>
+      <div class="acct">
+        <div id="keyField" hidden>
+          <div class="acct-row">
+            <div class="acct-key">
+              <div class="acct-label">API-ключ</div>
+              <div class="acct-val" id="keyInfo">—</div>
+            </div>
+            <button type="button" class="link" id="resetKey" hidden>Вернуть встроенный</button>
+          </div>
+          <div class="row">
+            <input type="password" id="setKey" placeholder="Вставьте новый ключ, если нужно сменить" autocomplete="off" spellcheck="false">
+            <button type="button" class="btn" id="saveKey">Сохранить</button>
+          </div>
+          <div class="key-msg" id="keyMsg"></div>
+        </div>
+        <div class="acct-links">
+          <a class="btn acct-site" href="https://venice.ai/" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>Открыть venice.ai
+          </a>
+          <a class="link" href="https://venice.ai/settings/api" target="_blank" rel="noopener">Где создать свой API-ключ</a>
+        </div>
+        <small>На сайте можно войти в аккаунт, пополнить баланс и создать собственный ключ — потом вставьте его сюда.</small>
+      </div>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="setVeniceSystem">
+      <span>Добавлять системный промпт Venice <small>(встроенная инструкция сервиса)</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="setReadLinks">
+      <span>Читать ссылки из сообщений <small>(GitHub, страницы, PDF — приложение скачает и покажет их модели)</small></span>
+    </label>
+    <h3 class="sub-head">Картинки</h3>
+    <label class="check">
+      <input type="checkbox" id="setSafeMode">
+      <span>Безопасный режим <small>(Venice размывает откровенные изображения)</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="setWatermark">
+      <span>Убирать водяной знак Venice <small>(если модель это поддерживает)</small></span>
+    </label>
+    </div>
+    <div class="tab-pane" data-pane="usage" hidden><div id="usageRoot"></div></div>
+    <div class="dialog-foot"><button class="primary">Готово</button></div>
+  </form>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
