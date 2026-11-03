@@ -1,6 +1,7 @@
 #!/bin/bash
 # Сборка «И ВСЕ 3,14здец».
 #   ./build.sh           — с ключом из venice-chat/.env: ставит в ~/Applications и кладёт .dmg на Рабочий стол
+#   ./build.sh dmg       — то же, но только .dmg (установленное приложение не трогает)
 #   ./build.sh release   — БЕЗ ключа: zip для релиза на GitHub (из него приложение обновляется само)
 # Перед сборкой закрой приложение: osascript -e 'quit app "И ВСЕ 3,14здец"'
 set -euo pipefail
@@ -66,10 +67,12 @@ KEY="$(grep -E '^VENICE_API_KEY=' "$ROOT/.env" 2>/dev/null | head -1 | cut -d= -
 if [ -n "$KEY" ]; then printf '%s' "$KEY" > "$APP/Contents/Resources/key.txt"; else echo "⚠️  В .env нет ключа — сборка без ключа"; fi
 codesign --force --deep -s - "$APP"
 
-echo "▸ Установка в ~/Applications…"
-mkdir -p "$HOME/Applications"
-rm -rf "$HOME/Applications/Venice Chat.app" "$HOME/Applications/$NAME.app"
-ditto "$APP" "$HOME/Applications/$NAME.app"
+if [ "$MODE" != "dmg" ]; then   # ./build.sh dmg — только .dmg, установленное приложение не трогаем
+  echo "▸ Установка в ~/Applications…"
+  mkdir -p "$HOME/Applications"
+  rm -rf "$HOME/Applications/Venice Chat.app" "$HOME/Applications/$NAME.app"
+  ditto "$APP" "$HOME/Applications/$NAME.app"
+fi
 
 echo "▸ Образ .dmg…"
 STAGE="$OUT/dmg"; mkdir -p "$STAGE"
