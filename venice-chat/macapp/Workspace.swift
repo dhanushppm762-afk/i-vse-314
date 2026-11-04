@@ -93,7 +93,8 @@ final class Workspace {
                 case "write": out = try write(r, body)
                 case "edit": out = try edit(r, body)
                 case "undo": out = try undo(r, body)
-                case "run": out = try run(r, body, id: id)
+                case "run": out = body["background"] as? Bool == true ? try startJob(r, body) : try run(r, body, id: id)
+                case "job": out = try jobStatus(r, body)
                 case "memory": out = memory(r, body)
                 case "symbols": out = try symbols(r, body)
                 default: throw FsError("Нет такой операции: \(op)")
@@ -356,14 +357,7 @@ final class Workspace {
         let command = body["command"] as? String ?? ""
         guard !command.trimmingCharacters(in: .whitespaces).isEmpty else { throw FsError("Пустая команда") }
         let timeout = Double(max(5, min(body["timeout"] as? Int ?? 120, 900)))
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", command]
-        p.currentDirectoryURL = r
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
-        env["TERM"] = "dumb"; env["NO_COLOR"] = "1"; env["CI"] = "1"
-        p.environment = env
+        let p = shellProcess(r, command)
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -391,6 +385,96 @@ final class Workspace {
             text = String(text.prefix(maxOutput / 3)) + "\n…[вывод сокращён: \(text.count) символов]…\n" + String(text.suffix(maxOutput * 2 / 3))
         }
         return ["code": p.terminationStatus, "output": text, "timedOut": timedOut]
+    }
+
+    private func shellProcess(_ r: URL, _ command: String) -> Process {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", command]
+        p.currentDirectoryURL = r
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        env["TERM"] = "dumb"; env["NO_COLOR"] = "1"; env["CI"] = "1"
+        p.environment = env
+        return p
+    }
+
+    private func clip(_ text: String) -> String {
+        text.count > maxOutput ? String(text.prefix(maxOutput / 3)) + "\n…[вывод сокращён: \(text.count) символов]…\n" + String(text.suffix(maxOutput * 2 / 3)) : text
+    }
+
+    // MARK: фоновые команды — долгая установка или сборка идёт, а модель тем временем читает код
+
+    private final class Job {
+        let p: Process, root: String, command: String
+        let lock = NSLock()
+        var out = Data(), seen = 0, stopped = false
+        init(_ p: Process, root: String, command: String) { self.p = p; self.root = root; self.command = command }
+    }
+    private var jobs: [String: Job] = [:]
+    private var jobCount = 0
+
+    private func startJob(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
+        let command = body["command"] as? String ?? ""
+        guard !command.trimmingCharacters(in: .whitespaces).isEmpty else { throw FsError("Пустая команда") }
+        let p = shellProcess(r, command)
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        p.standardInput = FileHandle.nullDevice
+        let job = Job(p, root: r.path, command: command)
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            job.lock.lock(); if job.out.count < 4_000_000 { job.out.append(d) }; job.lock.unlock()
+        }
+        try p.run()
+        lock.lock(); jobCount += 1; let id = "job\(jobCount)"; jobs[id] = job; lock.unlock()
+        // пару секунд ждём: короткая команда успеет закончиться, у долгой будет видно начало
+        let until = Date().addingTimeInterval(3)
+        while p.isRunning && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
+        return try jobStatus(r, ["job": id])
+    }
+
+    private func jobStatus(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
+        let id = body["job"] as? String ?? ""
+        lock.lock(); let found = jobs[id]; lock.unlock()
+        guard let job = found, job.root == r.path else { throw FsError("Фоновой команды \(id) нет") }
+        if body["stop"] as? Bool == true && job.p.isRunning {
+            job.stopped = true
+            stopTree(job.p)
+            let until = Date().addingTimeInterval(3)
+            while job.p.isRunning && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
+        }
+        let until = Date().addingTimeInterval(Double(max(0, min(body["wait"] as? Int ?? 0, 60))))
+        while job.p.isRunning && Date() < until { Thread.sleep(forTimeInterval: 0.2) }
+        if !job.p.isRunning { Thread.sleep(forTimeInterval: 0.15) }   // дочитать последние строки
+        job.lock.lock(); let fresh = job.out.subdata(in: job.seen..<job.out.count); job.seen = job.out.count; job.lock.unlock()
+        var out: [String: Any] = ["job": id, "command": job.command, "running": job.p.isRunning, "stopped": job.stopped,
+                                  "output": clip(String(decoding: fresh, as: UTF8.self))]
+        if !job.p.isRunning { out["code"] = job.p.terminationStatus }
+        return out
+    }
+
+    /// Останавливает команду вместе с запущенными ею процессами (npm, сервер и т. п.)
+    private func stopTree(_ p: Process) {
+        func kids(_ pid: Int32) -> [Int32] {
+            let q = Process(); q.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); q.arguments = ["-P", String(pid)]
+            let pipe = Pipe(); q.standardOutput = pipe; q.standardError = FileHandle.nullDevice
+            guard (try? q.run()) != nil else { return [] }
+            q.waitUntilExit()
+            return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).split(separator: "\n").compactMap { Int32($0) }
+        }
+        var all: [Int32] = [], queue = [p.processIdentifier]
+        while let pid = queue.popLast(), all.count < 500 { let k = kids(pid); all += k; queue += k }
+        for pid in all.reversed() { kill(pid, SIGTERM) }
+        p.terminate()
+    }
+
+    /// Выход из приложения — фоновые команды не оставляем
+    func stopAllJobs() {
+        lock.lock(); let list = jobs.values.filter { $0.p.isRunning }; lock.unlock()
+        for job in list { stopTree(job.p) }
     }
 
     // MARK: карта кода — функции, классы и типы по файлам (как repo map у помощников для кода)

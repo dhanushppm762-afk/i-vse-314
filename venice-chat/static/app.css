@@ -514,3 +514,5 @@ a.file-card:hover { border-color: var(--faint); }
 .field select, .field input[type=number] { display: block; width: 100%; max-width: 360px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); padding: 8px 12px; outline: none; font: inherit; font-size: 14px; }
 .field input[type=number] { max-width: 140px; }
 .field select:focus, .field input[type=number]:focus { border-color: var(--faint); }
+.rollback { margin: 6px 0 10px; }
+.rollback .btn { font-size: 12.5px; padding: 5px 10px; }

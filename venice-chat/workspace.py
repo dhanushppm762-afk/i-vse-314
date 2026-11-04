@@ -7,7 +7,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -49,6 +51,8 @@ class Workspace:
         self.backups = data_dir / "backups"
         self.memory_dir = data_dir / "memory"
         self.running = {}
+        self.jobs = {}
+        self.job_count = 0
 
     # ---- разрешённые папки ----
     def allowed(self):
@@ -162,7 +166,9 @@ class Workspace:
         r = self.root(body)
         fn = {"info": self.info, "list": self.list, "grep": self.grep, "read": self.read, "write": self.write,
               "edit": self.edit, "undo": self.undo, "run": self.run, "memory": self.memory,
-              "symbols": self.symbols}.get(op)
+              "symbols": self.symbols, "job": self.job}.get(op)
+        if op == "run" and body.get("background"):
+            fn = self.start_job
         if not fn:
             raise FsError(f"Нет такой операции: {op}")
         return fn(r, body)
@@ -337,14 +343,88 @@ class Workspace:
             p.unlink()
         return {"ok": True, "path": meta["path"]}
 
+    @staticmethod
+    def shell_env():
+        env = dict(os.environ, TERM="dumb", NO_COLOR="1", CI="1")
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
+        return ("/bin/zsh" if Path("/bin/zsh").exists() else "/bin/bash"), env
+
+    @staticmethod
+    def clip(text):
+        if len(text) > MAX_OUTPUT:
+            return text[:MAX_OUTPUT // 3] + f"\n…[вывод сокращён: {len(text)} символов]…\n" + text[-MAX_OUTPUT * 2 // 3:]
+        return text
+
+    # ---- фоновые команды: долгая установка или сборка идёт, а модель тем временем читает код ----
+    def start_job(self, r, body):
+        cmd = str(body.get("command") or "").strip()
+        if not cmd:
+            raise FsError("Пустая команда")
+        shell, env = self.shell_env()
+        proc = subprocess.Popen([shell, "-lc", cmd], cwd=r, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        job = {"proc": proc, "root": str(r), "command": cmd, "out": bytearray(), "seen": 0, "stopped": False,
+               "lock": threading.Lock()}
+
+        def pump():
+            for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+                with job["lock"]:
+                    if len(job["out"]) < 4_000_000:
+                        job["out"] += chunk
+        threading.Thread(target=pump, daemon=True).start()
+        self.job_count += 1
+        jid = f"job{self.job_count}"
+        self.jobs[jid] = job
+        end = time.time() + 3
+        while proc.poll() is None and time.time() < end:
+            time.sleep(0.1)
+        return self.job(r, {"job": jid})
+
+    def job(self, r, body):
+        jid = str(body.get("job") or "")
+        job = self.jobs.get(jid)
+        if not job or job["root"] != str(r):
+            raise FsError(f"Фоновой команды {jid} нет")
+        proc = job["proc"]
+        if body.get("stop") and proc.poll() is None:
+            job["stopped"] = True
+            self.stop_tree(proc)
+        end = time.time() + max(0, min(int(body.get("wait") or 0), 60))
+        while proc.poll() is None and time.time() < end:
+            time.sleep(0.2)
+        if proc.poll() is not None:
+            time.sleep(0.15)
+        with job["lock"]:
+            fresh = bytes(job["out"][job["seen"]:])
+            job["seen"] = len(job["out"])
+        out = {"job": jid, "command": job["command"], "running": proc.poll() is None, "stopped": job["stopped"],
+               "output": self.clip(fresh.decode("utf-8", errors="replace"))}
+        if proc.poll() is not None:
+            out["code"] = proc.returncode
+        return out
+
+    @staticmethod
+    def stop_tree(proc):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+    def stop_all_jobs(self):
+        for job in self.jobs.values():
+            if job["proc"].poll() is None:
+                self.stop_tree(job["proc"])
+
     def run(self, r, body):
         cmd = str(body.get("command") or "").strip()
         if not cmd:
             raise FsError("Пустая команда")
         timeout = max(5, min(int(body.get("timeout") or 120), 900))
-        env = dict(os.environ, TERM="dumb", NO_COLOR="1", CI="1")
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
-        shell = "/bin/zsh" if Path("/bin/zsh").exists() else "/bin/bash"
+        shell, env = self.shell_env()
         timed_out = False
         try:
             proc = subprocess.run([shell, "-lc", cmd], cwd=r, env=env, stdin=subprocess.DEVNULL,

@@ -419,6 +419,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        WORKSPACE.stop_all_jobs()
 
 
 if __name__ == "__main__":

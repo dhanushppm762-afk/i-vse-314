@@ -57,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ n: Notification) { Workspace.shared.stopAllJobs() }
 
     // MARK: меню
 

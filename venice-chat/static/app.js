@@ -454,6 +454,7 @@ $("#thread").addEventListener("click", e => {
       break;
     }
     case "undo": undoStep(S.chat, m, m.steps[+btn.dataset.k]); break;
+    case "undo-all": undoAll(S.chat, m); break;
     case "toggle-diff": { const st = m.steps[+btn.dataset.k]; st.open = !st.open; updateMessage(S.chat, m); break; }
   }
 });
@@ -1598,10 +1599,11 @@ function renderSteps(m, live) {
   const all = m.steps.map(one).filter(Boolean);
   const plan = planHtml(m, live);
   if (!all.length) return plan;
+  const rb = live ? "" : rollbackHtml(m);
   if (all.length > 6 && !live) {
-    return `${plan}<div class="steps"><details class="steps-more"><summary>Ещё ${plural(all.length - 5, "шаг", "шага", "шагов")}</summary>${all.slice(0, -5).join("")}</details>${all.slice(-5).join("")}</div>`;
+    return `${plan}<div class="steps"><details class="steps-more"><summary>Ещё ${plural(all.length - 5, "шаг", "шага", "шагов")}</summary>${all.slice(0, -5).join("")}</details>${all.slice(-5).join("")}</div>${rb}`;
   }
-  return `${plan}<div class="steps">${all.join("")}</div>`;
+  return `${plan}<div class="steps">${all.join("")}</div>${rb}`;
 }
 
 function snapText(snap) {
@@ -1847,6 +1849,9 @@ async function runAgent(chat) {
     if (e.name !== "AbortError") msg.error = e.message;
   } finally {
     for (const resolve of S.approvals.values()) resolve(false);
+    // фоновые команды этого ответа не оставляем работать после него
+    for (const job of msg.jobs || []) fsApi("job", { root: folder.path, job, stop: true }).catch(() => {});
+    delete msg.jobs;
     for (const st of msg.steps) if (st.status === "run" || st.status === "ask") st.status = "err";
     if (S.browserBusy) { S.browserBusy = false; browserCmd("busy", { on: false }).catch(() => {}); }
     if (total.any) {
@@ -1863,8 +1868,8 @@ async function runAgent(chat) {
 // ================= Папка проекта: модель читает, ищет и (с разрешения) меняет файлы =================
 // Как у Claude Code: модель не получает весь код сразу, а сама ищет нужное (list_files, grep) и читает
 // только нужные места (read_file). Правки — точечные (edit_file), каждая с показом разницы и кнопкой «Отменить».
-const fsApi = async (op, body = {}) => {
-  const res = await fetch("/api/fs/" + op, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const fsApi = async (op, body = {}, signal) => {
+  const res = await fetch("/api/fs/" + op, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
   const data = await res.json().catch(() => ({ error: `Ошибка ${res.status}` }));
   if (!res.ok || data.error) throw new Error(data.error || `Ошибка ${res.status}`);
   return data;
@@ -1907,7 +1912,8 @@ const FS_TOOLS = [
   { name: "read_file", description: "Прочитать файл с номерами строк. По умолчанию первые 800 строк; дальше — offset (номер строки, с которой читать) и limit (сколько строк). Номера строк — только для ориентира, в edit_file их не включай.", parameters: { type: "object", properties: { path: { type: "string" }, offset: { type: "integer" }, limit: { type: "integer" } }, required: ["path"] } },
   { name: "edit_file", description: "Точечная правка: заменить в файле кусок old на new. old должен совпадать с файлом символ в символ (с отступами) и встречаться ровно один раз — добавь соседние строки, если нужно; all=true — заменить все вхождения. Перед правкой обязательно прочитай это место через read_file. Пользователь видит разницу и подтверждает правку.", parameters: { type: "object", properties: { path: { type: "string" }, old: { type: "string" }, new: { type: "string" }, all: { type: "boolean" } }, required: ["path", "old", "new"] } },
   { name: "write_file", description: "Создать новый файл (или полностью перезаписать существующий) с содержимым content. Для изменения существующих файлов предпочитай edit_file.", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } },
-  { name: "run_command", description: "Выполнить команду терминала (zsh) в папке проекта: тесты, сборка, линтер, git status / git diff, установка зависимостей. Возвращает код выхода и вывод. Не запускай серверы и команды, которые не завершаются сами. Пользователь подтверждает каждую команду.", parameters: { type: "object", properties: { command: { type: "string" }, timeout: { type: "integer", description: "секунд, по умолчанию 120, максимум 900" } }, required: ["command"] } },
+  { name: "run_command", description: "Выполнить команду терминала (zsh) в папке проекта: тесты, сборка, линтер, git status / git diff, установка зависимостей. Возвращает код выхода и вывод. background=true — для долгих команд (установка зависимостей, полная сборка, долгие тесты) и серверов: команда идёт в фоне, ты сразу получаешь номер задачи и первые строки вывода и можешь дальше читать код; результат — через command_status. Фоновые команды останавливаются, когда ты закончишь ответ. Пользователь подтверждает каждую команду.", parameters: { type: "object", properties: { command: { type: "string" }, timeout: { type: "integer", description: "секунд, по умолчанию 120, максимум 900 (без background)" }, background: { type: "boolean" } }, required: ["command"] } },
+  { name: "command_status", description: "Фоновая команда (run_command с background=true): новый вывод с прошлой проверки, идёт ли она ещё и код выхода. wait — сколько секунд подождать завершения (до 60). stop=true — остановить команду.", parameters: { type: "object", properties: { job: { type: "string" }, wait: { type: "integer" }, stop: { type: "boolean" } }, required: ["job"] } },
   { name: "code_map", description: "Карта кода: для каждого файла — число строк и объявленные функции, классы, типы с номерами строк (имя:строка). Самый быстрый способ понять устройство папки, не читая файлы. dir — папка, glob — какие файлы (\"*.ts\").", parameters: { type: "object", properties: { dir: { type: "string" }, glob: { type: "string" } } } },
   { name: "find_symbol", description: "Найти, где объявлено имя (функция, класс, переменная, тип) и где оно используется. Удобно перед правкой: увидеть всех, кого она заденет.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
   { name: "explore", description: "Поручить разведку помощнику с отдельным контекстом: он сам ищет и читает файлы и возвращает короткий отчёт с путями и номерами строк. Для широких вопросов («как устроена авторизация», «где считается цена», «какие файлы затронет задача»), чтобы не забивать свой контекст десятками файлов. Несколько explore в одном ответе работают параллельно. Помощник только читает и ничего не меняет.", parameters: { type: "object", properties: { task: { type: "string", description: "Что выяснить, подробно и конкретно" } }, required: ["task"] } },
@@ -1934,6 +1940,7 @@ const folderRules = (folder, info) => {
 - Независимые чтения и поиски вызывай пачкой в одном ответе — они выполнятся одновременно.
 - Крупную задачу (несколько файлов, новая функция) сначала изучи, затем покажи план через propose_plan и меняй файлы только после одобрения. Шаги веди через update_plan и отмечай выполненные.
 - Меняй код маленькими точечными правками edit_file в стиле проекта. Новый файл — write_file. Не переписывай файлы целиком без необходимости.
+- Долгие команды (установка зависимостей, полная сборка, долгие тесты) запускай с background=true и, пока они идут, читай код; потом проверь результат через command_status.
 - После правок проверь себя: запусти тесты, сборку или линтер проекта через run_command (как их запускать — смотри package.json, Makefile, README, AGENTS.md). Если упало — прочитай ошибку и исправь.
 - Если пользователь отказал в правке или команде — не обходи запрет, спроси или предложи другое.
 - Узнал о проекте что-то устойчивое и полезное на будущее (как собрать, как проверить, где что лежит) — сохрани через remember.
@@ -2000,7 +2007,7 @@ async function fsTool(name, args, chat, msg, step) {
       if (!await ask(`изменить ${dry.path}`, "edit")) return { status: "denied", label: `Вы запретили правку ${shortPath(args.path)}`, text: "Пользователь отклонил эту правку. Спроси, что поменять, или предложи другой вариант." };
       step.status = "run";
       const r = await fsApi("edit", { root, path: args.path, old: args.old, new: args.new, all: args.all });
-      step.undo = r.backup;
+      step.undo = r.backup; step.path = r.path;
       return { status: "ok", label: `Изменил ${shortPath(r.path)}${r.replaced > 1 ? ` (${r.replaced} мест)` : ""}`, text: `Готово: ${r.path}, замен: ${r.replaced}, начиная со строки ${r.line}.` };
     }
     case "write_file": {
@@ -2012,7 +2019,7 @@ async function fsTool(name, args, chat, msg, step) {
       if (!await ask(old == null ? `создать файл ${args.path}` : `перезаписать файл ${args.path}`, "edit")) return { status: "denied", label: `Вы запретили запись ${shortPath(args.path)}`, text: "Пользователь отклонил запись этого файла." };
       step.status = "run";
       const r = await fsApi("write", { root, path: args.path, content: args.content });
-      step.undo = r.backup;
+      step.undo = r.backup; step.path = r.path;
       return { status: "ok", label: `${r.created ? "Создал" : "Перезаписал"} ${shortPath(r.path)}`, text: `Готово: ${r.path} ${r.created ? "создан" : "перезаписан"} (${String(args.content).split("\n").length} строк).` };
     }
     case "run_command": {
@@ -2021,11 +2028,28 @@ async function fsTool(name, args, chat, msg, step) {
       if (!await ask(`выполнить команду в папке «${folder.name}»`, "run")) return { status: "denied", label: `Вы запретили команду ${shortText(args.command, 50)}`, text: "Пользователь запретил эту команду." };
       step.status = "run";
       scheduleUpdate(chat, msg);
+      if (args.background) {
+        const r = await fsApi("run", { root, command: args.command, background: true });
+        (msg.jobs ||= []).push(r.job);
+        step.output = r.output.trim().split("\n").slice(-6).join("\n");
+        return { status: r.running || r.code === 0 ? "ok" : "err", label: r.running ? `Фоновая команда ${r.job}: ${shortText(args.command, 55)}` : `${r.code === 0 ? "Выполнено" : `Ошибка (код ${r.code})`}: ${shortText(args.command, 60)}`,
+          text: r.running ? `Команда запущена в фоне, номер ${r.job}. Пока она идёт, продолжай работу; проверить — command_status.\nПервый вывод:\n${r.output || "(пока пусто)"}`
+            : `Команда уже завершилась. Код выхода: ${r.code}\nВывод:\n${r.output || "(пусто)"}` };
+      }
       const r = await fsApi("run", { root, command: args.command, timeout: args.timeout });
       const tail = r.output.trim().split("\n").slice(-6).join("\n");
       step.output = tail;
       return { status: r.code === 0 ? "ok" : "err", label: `${r.timedOut ? "Прервано по времени" : r.code === 0 ? "Выполнено" : `Ошибка (код ${r.code})`}: ${shortText(args.command, 60)}`,
         text: `Код выхода: ${r.code}${r.timedOut ? " (прервано по таймауту)" : ""}\nВывод:\n${r.output || "(пусто)"}` };
+    }
+    case "command_status": {
+      step.text = `Проверяю фоновую команду ${args.job}`;
+      scheduleUpdate(chat, msg);
+      const r = await fsApi("job", { root, job: args.job, wait: Math.min(+args.wait || 0, 60), stop: !!args.stop }, S.stream?.controller.signal);
+      if (r.output.trim()) step.output = r.output.trim().split("\n").slice(-6).join("\n");
+      const state = r.running ? "ещё идёт" : r.stopped ? "остановлена" : r.code === 0 ? "завершилась успешно" : `завершилась с ошибкой (код ${r.code})`;
+      return { status: r.running || r.stopped || r.code === 0 ? "ok" : "err", label: `Фоновая команда ${r.job} ${state}: ${shortText(r.command, 50)}`,
+        text: `Команда «${r.command}» ${state}.\nНовый вывод с прошлой проверки:\n${r.output || "(нет)"}` };
     }
     case "code_map": {
       const r = await fsApi("symbols", { root, dir: args.dir, glob: args.glob, maxChars: 60_000 });
@@ -2155,6 +2179,32 @@ async function undoStep(chat, m, st) {
     updateMessage(chat, m);
     toast("Правка отменена");
   } catch (e) { toast("Не получилось отменить: " + e.message); }
+}
+
+// «Откатить все изменения»: отменяем правки ответа с последней к первой — каждая копия хранит файл до своей правки,
+// поэтому в конце файлы оказываются такими, какими были до задачи. Новые файлы, созданные моделью, удаляются.
+const undoable = m => (m.steps || []).filter(st => st.undo && st.status === "ok" && !st.undone);
+function rollbackHtml(m) {
+  const list = undoable(m);
+  if (!list.length) return "";
+  const files = new Set(list.map(st => st.path || st.where || st.text)).size;
+  const ran = (m.steps || []).some(st => st.kind === "run" || /^(Выполнено|Ошибка \(код|Прервано|Фоновая)/.test(st.text || ""));
+  return `<div class="rollback"><button class="btn" data-act="undo-all" title="Вернуть файлы к состоянию до этого ответа${ran ? ". Результаты команд (установка, сборка) не откатываются" : ""}">↶ Откатить все изменения (${plural(files, "файл", "файла", "файлов")})</button></div>`;
+}
+
+async function undoAll(chat, m) {
+  const list = undoable(m);
+  if (!list.length) return;
+  const files = new Set(list.map(st => st.path || st.where || st.text)).size;
+  if (!confirm(`Вернуть ${plural(files, "файл", "файла", "файлов")} к состоянию до этого ответа? Созданные моделью файлы будут удалены.`)) return;
+  let failed = 0;
+  for (const st of list.reverse()) {
+    try { await fsApi("undo", { root: folderOf(chat)?.path, backup: st.undo }); st.undo = null; st.undone = true; }
+    catch { failed++; }
+  }
+  persist(chat);
+  updateMessage(chat, m);
+  toast(failed ? `Откатил не всё: ${plural(failed, "правку", "правки", "правок")} отменить не удалось` : "Все изменения этого ответа отменены");
 }
 
 const folderBtn = $("#folderBtn");

@@ -109,7 +109,19 @@ try {
   try { await slow; } catch {}
   r.fsRunStop = Date.now() - t0 < 5000;
   r.fsMemory = (await fs("memory", { add: "тест" })).notes.includes("тест");
-  r.fsUI = !!document.querySelector("#folderBtn") && typeof fsTool === "function" && FS_TOOLS.length === 12 && !document.querySelector("#agentBtn");
+  r.fsUI = !!document.querySelector("#folderBtn") && typeof fsTool === "function" && FS_TOOLS.length === 13 && typeof undoAll === "function" && !document.querySelector("#agentBtn");
+  // фоновая команда: сразу возвращается, потом видно завершение; долгую можно остановить
+  const bg = await fs("run", { command: "echo bg-start; sleep 1; echo bg-end", background: true });
+  const bgDone = await fs("job", { job: bg.job, wait: 10 });
+  const bgLong = await fs("run", { command: "sleep 60", background: true });
+  const bgStop = await fs("job", { job: bgLong.job, stop: true });
+  r.fsJob = bg.running + "/" + bg.output.trim() + " → " + bgDone.running + "/" + bgDone.code + "/" + bgDone.output.trim() + "; stop=" + (bgStop.stopped && !bgStop.running);
+  // «Откатить всё»: две правки подряд, откат с последней — файл как был
+  const e1 = await fs("edit", { path: "src/app.js", old: "return 1;", new: "return 2;" });
+  const e2 = await fs("edit", { path: "src/app.js", old: "return 2;", new: "return 3;" });
+  const n1 = await fs("write", { path: "rollback-new.txt", content: "x" });
+  for (const b of [n1.backup, e2.backup, e1.backup]) await fs("undo", { backup: b });
+  r.fsRollback = (await fs("read", { path: "src/app.js" })).text.includes("return 1;") && !!(await fs("read", { path: "rollback-new.txt" })).error;
   const sym = await fs("symbols", {});
   r.fsSymbols = sym.files + " file(s): " + sym.map;
 } catch (e) { r.fsError = String(e); }
