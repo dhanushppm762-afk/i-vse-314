@@ -867,7 +867,7 @@ function toApi(m) {
   let content = m.role === "assistant" ? splitThink(m).content : m.content;
   const acts = (m.steps || []).filter(st => st.status !== "note" && st.status !== "plan");
   const actText = st => st.text + (st.undone ? " (пользователь отменил)" : "");
-  if (m.workNote) content = `${content}\n\n[Сводка твоей работы в этом ответе (ответ прервался, продолжай с этого места):\n${m.workNote}]`.trim();
+  if (m.workNote) { if (!content.includes(m.workNote)) content = `${content}\n\n[Сводка твоей работы в этом ответе (ответ прервался, продолжай с этого места):\n${m.workNote}]`.trim(); }
   else if (acts.length) content = `${content}\n\n[Твои действия: ${acts.length > 30 ? `…ещё ${acts.length - 30} раньше; ` : ""}${acts.slice(-30).map(actText).join("; ")}]`.trim();
   if (!m.files?.length) return { role: m.role, content };
   let text = content || "";
@@ -1886,6 +1886,7 @@ async function runAgent(chat) {
       total.usd += u.usd ?? textCost(chat.model, u.in, u.out) ?? 0;
     };
     const seen = new Map();   // одинаковые вызовы: подпись → сколько раз
+    const pieces = new Map(); // файл → сколько раз его читали кусками
     let stopped = false;       // ответ прервался по лимиту шагов или денег — тогда сохраним сводку работы
     for (let step = 0; step < MAX_STEPS; step++) {
       const turn = await agentTurn(chat, msg, convo, controller, tools);
@@ -1911,6 +1912,13 @@ async function runAgent(chat) {
         const sig = call.name + " " + (call.args || "").replace(/\s+/g, " ");
         const times = (seen.get(sig) || 0) + 1;
         seen.set(sig, times);
+        let ca = {};
+        try { ca = JSON.parse(call.args || "{}"); } catch {}
+        for (const f of fileTargets(call.name, ca)) {
+          const n = (pieces.get(f) || 0) + 1;
+          pieces.set(f, n);
+          if (n % PIECE_HINT === 0) result.text += `\n\n[Приложение: файл ${f} ты читаешь по кускам уже ${n}-й раз. Хватит читать — напиши ОДИН скрипт (python3), который сделает всё нужное преобразование целиком, запусти и проверь результат выборочно.]`;
+        }
         if (times >= 3 && READ_LIKE.has(call.name)) result.text += `\n\n[Приложение: ты делаешь этот же вызов уже ${times}-й раз. Если ничего не менялось — не повторяй, используй то, что уже знаешь, и переходи к делу.]`;
 
         convo.push({ role: "tool", tool_call_id: call.id, content: result.text, tool: call.name,
@@ -1936,7 +1944,7 @@ async function runAgent(chat) {
     if (stopped && folder && convo.length > keep + 2) {
       const st = { status: "run", text: "Сохраняю сводку работы, чтобы продолжить с этого места" };
       msg.steps.push(st); scheduleUpdate(chat, msg);
-      try { const r = await workSummary(chat, convo, controller, "Ответ сейчас прервётся, пользователь напишет «продолжай»."); msg.workNote = r.text; add(r.usage); st.status = "ok"; st.text = "Сохранил сводку работы — «продолжай» начнёт с этого места"; }
+      try { const r = await workSummary(chat, convo, controller, "Ответ сейчас прервётся, пользователь напишет «продолжай»."); msg.workNote = r.text; msg.content = `${msg.content.trim()}\n\n**Где остановился** (напишите «продолжай», чтобы продолжить с этого места):\n\n${r.text}`.trim(); add(r.usage); st.status = "ok"; st.text = "Сохранил сводку работы — «продолжай» начнёт с этого места"; }
       catch (e) { if (e.name === "AbortError") throw e; st.status = "err"; st.text = "Сводку сохранить не удалось"; }
     }
     if (!msg.content.trim() && !msg.steps.length) msg.error = "Модель вернула пустой ответ.";
@@ -2040,6 +2048,19 @@ function isSafeCommand(cmd) {
 // что считается «чтением» для подсказки о повторах, и что — изменением файлов
 const READ_LIKE = new Set(["list_files", "grep", "read_file", "code_map", "find_symbol", "run_command", "browser_screenshot", "browser_read", "archive_read", "web_search"]);
 const CHECKPOINT = 40;
+// установка программ и браузеров — только если пользователь сам об этом просил
+const INSTALL_RE = /\b(playwright\s+install|npx\s+(-y\s+)?playwright|puppeteer|chromium|pip3?\s+install|python3?\s+-m\s+pip\s+install|npm\s+(i|install|add)\s+(-g|--global)\b|brew\s+install|apt(-get)?\s+install|gem\s+install|cargo\s+install)/i;
+const ASKED_INSTALL = /установ|install|постав|библиотек|зависимост|пакет|playwright|браузер/i;
+// удаление папок и сброс изменений — всегда с вопросом, даже если команды в чате разрешены
+const DANGER_RE = /\brm\s+(-\w*[rR]\w*|--recursive)\b|\bfind\b.*\s-delete\b|\bgit\s+(clean\b|reset\s+--hard|checkout\s+(--\s+)?\.(\s|$)|restore\s+\.)/;
+// чтение одного файла кусками: какие файлы упоминает команда-«читалка»
+const READ_CMD = /^\s*(sed|head|tail|cat|awk|grep|rg|wc|cut|python3?\s+-c)\b/;
+const fileTargets = (name, a) => {
+  if (name === "read_file") return a.path ? [normPath(a.path)] : [];
+  if (name === "run_command" && READ_CMD.test(String(a.command || ""))) return [...new Set(String(a.command).match(/[\w./-]+\.(html?|css|js|json|txt|md|py|xml|svg|ts|jsx|tsx)\b/g) || [])].map(normPath);
+  return [];
+};
+const PIECE_HINT = 8;
 const LEFT_RUNNING = /(^|[^&>|])&\s*($|;|\n|\))|\bnohup\b|\bdisown\b/;
 const safeCall = c => { try { const a = JSON.parse(c.args || "{}"); return !a.background && isSafeCommand(a.command); } catch { return false; } };
 
@@ -2054,6 +2075,7 @@ const folderRules = (folder, info, browser) => {
 - Изучай ровно столько, сколько нужно, чтобы начать: обычно это 5–15 шагов, а не десятки. Потом действуй. Написал «сейчас соберу/исправлю» — делай это в этом же шаге, не уходи снова проверять.
 - Не читай повторно то, что уже видел, если файл не менялся, — опирайся на то, что знаешь.
 - Большой файл (тысячи строк или сотни КБ, например сохранённая страница) не читай кусками по много раз. Посмотри структуру (grep по тегам, начало файла), затем напиши ОДИН скрипт (python3), который сделает всё преобразование целиком, запусти его и проверь результат выборочно (размер, grep, пара мест). Не получилось — поправь этот же скрипт, не начинай заново.
+- Не устанавливай программы, браузеры и пакеты (playwright, puppeteer, pip, brew…), если пользователь не просил. Снимок страницы — только browser_screenshot. Не удаляй папки пользователя целиком.
 - Результат клади туда, куда просил пользователь; если не сказано — меняй файлы на месте (копию для отката приложение делает само) или в одну папку результата. Черновики и временные файлы удаляй в конце.
 
 Как работать (как опытный разработчик):
@@ -2074,7 +2096,7 @@ const folderRules = (folder, info, browser) => {
 - Когда задача сделана и проверена — сделай коммит только своих файлов (git add путь… и git commit -m "…") с понятным описанием на языке пользователя: первая строка — что сделано, ниже — зачем и как проверено. Мелкие правки в одну-две строки коммить, только если пользователь просит.
 - Никогда не делай git push, reset --hard, rebase, checkout чужих файлов, force и не удаляй ветки без прямой просьбы пользователя.`);
   if (browser) lines.push(`Проверка глазами — один раз в конце, если ты менял внешний вид сайта:
-- Запусти сайт в фоне (run_command с background=true: dev-сервер из package.json или python3 -m http.server 8000 для простого сайта), открой адрес через browser_open с http://, сделай один browser_screenshot (при необходимости — ещё один после прокрутки).
+- Запусти сайт в фоне (run_command с background=true: dev-сервер из package.json или python3 -m http.server 8000 для простого сайта; порт 8765 занят приложением), открой адрес через browser_open с http://, сделай один browser_screenshot (при необходимости — ещё один после прокрутки).
 - Без попиксельных сравнений, эталонных снимков и измерений. Если что-то явно сломано — поправь и посмотри ещё раз, не больше.
 - Остановить сервер: command_status со stop=true.`);
   if (info.map) lines.push(`Карта кода (файл (строк): имя:строка, …)${info.mapTruncated ? " — НЕПОЛНАЯ, остальное смотри через code_map с dir" : ""}:\n${info.map}`);
@@ -2179,13 +2201,22 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
     case "run_command": {
       step.text = `Выполняю: ${shortText(args.command, 70)}`;
       step.where = args.command;
+      const userText = chat.messages.filter(m => m.role === "user").map(m => m.content || "").join("\n");
+      if (INSTALL_RE.test(String(args.command || "")) && !ASKED_INSTALL.test(userText)) return { status: "err", label: `Не запущено (установка): ${shortText(args.command, 50)}`, text: "Пользователь не просил ничего устанавливать. Не ставь программы, браузеры и пакеты — обойдись тем, что есть (для снимка страницы есть browser_screenshot). Если без установки задачу правда не сделать — коротко спроси пользователя и закончи ответ." };
+      if (DANGER_RE.test(String(args.command || ""))) {
+        step.kind = null;   // без кнопки «разрешать в этом чате»
+        if (!await askApproval(chat, msg, step, `удалить или сбросить файлы: ${shortText(args.command, 80)}`)) return { status: "denied", label: `Вы запретили: ${shortText(args.command, 50)}`, text: "Пользователь запретил удаление. Не удаляй папки и файлы пользователя; временные файлы клади в отдельную папку и удаляй по одному файлу." };
+        step.status = "run";
+        args.__asked = true;
+      }
       if (!args.background && LEFT_RUNNING.test(String(args.command || ""))) return { status: "err", label: `Не запущено: ${shortText(args.command, 50)}`, text: "Не запускай процессы через & или nohup: они остаются работать после команды. Для сервера или долгой команды вызови run_command с background=true (без &), а останови через command_status со stop=true." };
-      if (!(isSafeCommand(args.command) && !args.background) && !await ask(`выполнить команду в папке «${folder.name}»`, "run")) return { status: "denied", label: `Вы запретили команду ${shortText(args.command, 50)}`, text: "Пользователь запретил эту команду." };
+      if (!args.__asked && !(isSafeCommand(args.command) && !args.background) && !await ask(`выполнить команду в папке «${folder.name}»`, "run")) return { status: "denied", label: `Вы запретили команду ${shortText(args.command, 50)}`, text: "Пользователь запретил эту команду." };
       step.status = "run";
       scheduleUpdate(chat, msg);
       if (args.background) {
         const r = await fsApi("run", { root, command: args.command, background: true });
         (msg.jobs ||= []).push(r.job);
+        (msg.jobStart ||= {})[r.job] = Date.now();
         step.output = r.output.trim().split("\n").slice(-6).join("\n");
         return { status: r.running || r.code === 0 ? "ok" : "err", label: r.running ? `Фоновая команда ${r.job}: ${shortText(args.command, 55)}` : `${r.code === 0 ? "Выполнено" : `Ошибка (код ${r.code})`}: ${shortText(args.command, 60)}`,
           text: r.running ? `Команда запущена в фоне, номер ${r.job}. Пока она идёт, продолжай работу; проверить — command_status.\nПервый вывод:\n${r.output || "(пока пусто)"}`
@@ -2203,8 +2234,10 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
       const r = await fsApi("job", { root, job: args.job, wait: Math.min(+args.wait || 0, 60), stop: !!args.stop }, streamOf(chat)?.controller.signal);
       if (r.output.trim()) step.output = r.output.trim().split("\n").slice(-6).join("\n");
       const state = r.running ? "ещё идёт" : r.stopped ? "остановлена" : r.code === 0 ? "завершилась успешно" : `завершилась с ошибкой (код ${r.code})`;
+      const mins = r.running && msg.jobStart?.[r.job] ? Math.floor((Date.now() - msg.jobStart[r.job]) / 60000) : 0;
+      const long = mins >= 3 ? `\n\n[Приложение: команда идёт уже ${mins} мин. Если она не обязательна для задачи — останови её (stop=true) и продолжай без неё.]` : "";
       return { status: r.running || r.stopped || r.code === 0 ? "ok" : "err", label: `Фоновая команда ${r.job} ${state}: ${shortText(r.command, 50)}`,
-        text: `Команда «${r.command}» ${state}.\nНовый вывод с прошлой проверки:\n${r.output || "(нет)"}` };
+        text: `Команда «${r.command}» ${state}.\nНовый вывод с прошлой проверки:\n${r.output || "(нет)"}${long}` };
     }
     case "code_map": {
       const r = await fsApi("symbols", { root, dir: args.dir, glob: args.glob, maxChars: 60_000 });
