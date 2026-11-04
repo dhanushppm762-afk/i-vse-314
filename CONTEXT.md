@@ -67,7 +67,7 @@
 | `GET/POST /api/key` | **только Swift**: показать/сменить ключ (проверка через `/api_keys/rate_limits`) |
 | `GET /api/update[?force=1]`, `POST /api/update` | **только Swift**: есть ли новый релиз на GitHub / скачать и установить |
 | `POST /api/fs/pick` | выбрать папку проекта (в приложении — окно выбора; в браузерной версии — `{path}`) и запомнить её в `folders.json` |
-| `POST /api/fs/info\|list\|grep\|read\|write\|edit\|undo\|run\|memory` | работа с папкой `{root, …}`: только папки из `folders.json`, выйти за пределы папки нельзя. `edit` с `dry:true` — проверка без записи; `write`/`edit` возвращают `backup` для `undo`; `run` — `zsh -lc` в папке, таймаут, «Стоп» убивает процесс. В server.py — только с localhost и `Content-Type: application/json` |
+| `POST /api/fs/info\|list\|grep\|read\|write\|edit\|undo\|run\|job\|memory\|symbols` | работа с папкой `{root, …}`: только папки из `folders.json`, выйти за пределы папки нельзя. `edit` с `dry:true` — проверка без записи; `write`/`edit` возвращают `backup` для `undo`; `run` — `zsh -lc` в папке, таймаут, «Стоп» убивает процесс. `run` с `background:true` — фоновая команда, сразу возвращает `job`; `job {job, wait, stop}` — новый вывод, идёт ли, код выхода (фоновые команды останавливаются в конце ответа модели и при выходе). Кнопка «Откатить все изменения» под ответом — `undo` всех правок ответа с последней к первой. В server.py — только с localhost и `Content-Type: application/json` |
 
 ### Данные пользователя (вне приложения — переживают обновления)
 `~/Library/Application Support/VeniceChat/`
