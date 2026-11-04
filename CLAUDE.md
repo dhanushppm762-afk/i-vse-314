@@ -5,6 +5,7 @@
 - Пользователь общается по-русски и не программист: отвечай просто, сначала результат.
 - Интерфейс — `venice-chat/static/` (общий для приложения и браузерной версии).
 - Маршруты `/api/*` есть в двух местах: `venice-chat/macapp/Backend.swift` и `venice-chat/server.py` — меняй оба.
+  Папка проекта (`/api/fs/*`) — `macapp/Workspace.swift` и `venice-chat/workspace.py`.
 - Сборка и `.dmg`: `./venice-chat/macapp/build.sh` (сначала `osascript -e 'quit app "И ВСЕ 3,14здец"'`).
 - Самотест: `VENICE_SELFTEST=1 "$HOME/Applications/И ВСЕ 3,14здец.app/Contents/MacOS/VeniceChat"`;
   агент: добавь `VENICE_AGENTTEST="задание"`.

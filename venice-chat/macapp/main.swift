@@ -49,7 +49,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         chatView.load(URLRequest(url: URL(string: "venice://app/")!))
         if selfTest {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { print("SELFTEST load failed: timeout"); exit(1) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard self?.testStarted == false else { return }
+                print("SELFTEST load failed: timeout"); exit(1)
+            }
         }
     }
 
@@ -211,12 +214,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func runSelfTest() {
-        chatView.callAsyncJavaScript(SelfTest.script, arguments: [:], in: nil, in: .page) { [weak self] in self?.finish($0) }
+        // временная папка-проект для проверки /api/fs/*
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("venice-selftest-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir.appendingPathComponent("src"), withIntermediateDirectories: true)
+        try? "function hello() {\n  return 1;\n}\n".write(to: dir.appendingPathComponent("src/app.js"), atomically: true, encoding: .utf8)
+        try? "# Проект для самотеста\n".write(to: dir.appendingPathComponent("AGENTS.md"), atomically: true, encoding: .utf8)
+        Workspace.shared.allow(dir.path)
+        let root = dir.resolvingSymlinksInPath().path
+        chatView.callAsyncJavaScript(SelfTest.script, arguments: ["fsRoot": root], in: nil, in: .page) { [weak self] result in
+            Workspace.shared.forget(root)
+            try? FileManager.default.removeItem(at: dir)
+            self?.finish(result)
+        }
     }
 
     private func runAgentTest(_ task: String) {
-        chatView.callAsyncJavaScript(SelfTest.agentScript, arguments: ["task": task, "deny": env["VENICE_AGENTTEST_DENY"] == "1"],
-                                     in: nil, in: .page) { [weak self] in self?.finish($0) }
+        // VENICE_AGENTTEST_FOLDER=путь — модель работает с этой папкой (правки и команды разрешаются автоматически)
+        var folder = env["VENICE_AGENTTEST_FOLDER"] ?? ""
+        if !folder.isEmpty { folder = URL(fileURLWithPath: folder).resolvingSymlinksInPath().path; Workspace.shared.allow(folder) }
+        chatView.callAsyncJavaScript(SelfTest.agentScript, arguments: ["task": task, "deny": env["VENICE_AGENTTEST_DENY"] == "1", "folder": folder],
+                                     in: nil, in: .page) { [weak self] in
+            if !folder.isEmpty { Workspace.shared.forget(folder) }
+            self?.finish($0)
+        }
     }
 }
 

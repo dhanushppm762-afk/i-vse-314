@@ -99,6 +99,7 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
         let id = ObjectIdentifier(urlSchemeTask)
         stopped.insert(id)
         live.removeValue(forKey: id)?.cancel()
+        Workspace.shared.cancel(id)
     }
 
     private static func body(of req: URLRequest) -> Data {
@@ -182,6 +183,8 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
             key(t, method: method, body: body)
         case (_, "chats"), (_, "projects"):
             store(t, method: method, folder: parts[1], id: parts.count > 2 ? parts[2].removingPercentEncoding : nil, body: body)
+        case ("POST", "fs") where parts.count == 3:
+            Workspace.shared.handle(t, op: parts[2], body: body)
         case (_, "update"):
             Updater.shared.handleAPI(t, method: method, body: body)
         default:

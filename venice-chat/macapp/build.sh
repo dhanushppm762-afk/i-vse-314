@@ -20,7 +20,7 @@ OUT="$ROOT/build"
 APP="$OUT/$NAME.app"
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-SOURCES=("$HERE"/main.swift "$HERE"/Backend.swift "$HERE"/Browser.swift "$HERE"/Updater.swift "$HERE"/SelfTest.swift)
+SOURCES=("$HERE"/main.swift "$HERE"/Backend.swift "$HERE"/Browser.swift "$HERE"/Updater.swift "$HERE"/Workspace.swift "$HERE"/SelfTest.swift)
 
 echo "▸ Компиляция $VERSION (arm64 + x86_64)…"
 for ARCH in arm64 x86_64; do

@@ -490,3 +490,22 @@ a.file-card:hover { border-color: var(--faint); }
 .app-version { display: flex; align-items: center; gap: 10px; margin: -4px 0 16px; color: var(--muted); font-size: 13px; }
 .app-version .link-btn { background: none; border: 0; padding: 0; color: var(--accent); font-size: 13px; cursor: pointer; }
 .app-version .link-btn:hover { text-decoration: underline; }
+
+/* Папка проекта: план, разница правок, вывод команд */
+.plan { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; font-size: 13.5px; }
+.plan-item { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.plan-item.done { color: var(--faint); text-decoration: line-through; }
+.plan-item.done .step-ico { color: #1baf7a; }
+.plan-item.doing { color: var(--text); }
+.plan-item .dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--faint); }
+.plan-item .spin { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--faint); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+.diff { flex-basis: 100%; margin: 4px 0 2px 24px; padding: 8px 10px; max-height: 320px; overflow: auto; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; color: var(--muted); }
+.diff .add { color: #1a9a6c; background: rgba(27, 175, 122, .1); display: inline-block; min-width: 100%; }
+.diff .del { color: var(--danger); background: rgba(220, 60, 60, .08); display: inline-block; min-width: 100%; }
+.diff.out { max-height: 140px; }
+.step-links { flex-basis: 100%; display: flex; gap: 14px; padding-left: 24px; font-size: 12.5px; }
+.step-links .link-btn { background: none; border: 0; padding: 0; color: var(--accent); font-size: 12.5px; cursor: pointer; }
+.step-links .link-btn:hover { text-decoration: underline; }
+.step-links .undone { color: var(--faint); }
+.step-ask { flex-wrap: wrap; }
+.folder-chip { cursor: pointer; }

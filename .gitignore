@@ -5,3 +5,4 @@ build/
 *.dmg
 *.app/
 key.txt
+__pycache__/

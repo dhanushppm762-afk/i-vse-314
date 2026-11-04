@@ -17,6 +17,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from workspace import FsError, Workspace
+
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
 DATA = Path.home() / "Library" / "Application Support" / "VeniceChat"
@@ -200,6 +202,7 @@ class NoPrivateRedirect(urllib.request.HTTPRedirectHandler):
 
 
 FETCH_OPENER = urllib.request.build_opener(NoPrivateRedirect)
+WORKSPACE = Workspace(DATA)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -275,6 +278,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.usage(method)
             if path == "/api/key":
                 return self.error(404, "Смена ключа есть только в приложении для Mac")
+            m = re.fullmatch(r"/api/fs/(\w+)", path)
+            if m and method == "POST":
+                return self.fs(m.group(1))
             m = re.fullmatch(r"/api/(chats|projects)(?:/([^/]+))?", path)
             if m:
                 return self.store(method, m.group(1), m.group(2) and urllib.parse.unquote(m.group(2)))
@@ -350,6 +356,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error(413, "Файл больше 80 МБ")
             self.send(200, data, resp.headers.get("Content-Type", "application/octet-stream"),
                       {"X-Final-URL": urllib.parse.quote(resp.geturl(), safe=":/?&=%#")})
+
+    def fs(self, op):
+        # Папка на диске и команды: только со своей страницы (защита от чужих сайтов, стучащихся на localhost)
+        origin = self.headers.get("Origin")
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if host not in ("localhost", "127.0.0.1") or (origin and urllib.parse.urlparse(origin).hostname not in ("localhost", "127.0.0.1")) \
+                or "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self.error(403, "Запрещено")
+        try:
+            return self.send(200, WORKSPACE.handle(op, self.json_body() or {}))
+        except FsError as e:
+            return self.error(400, str(e))
 
     def usage(self, method):
         path = DATA / "usage.json"

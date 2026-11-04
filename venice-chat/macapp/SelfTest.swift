@@ -4,14 +4,15 @@ enum SelfTest {
     static let agentScript = #"""
 await new Promise(r => setTimeout(r, 2500));
 const before = S.settings.agent;
-S.settings.agent = true; setMode("chat"); newChat();
+S.settings.agent = !folder; setMode("chat"); newChat();
+if (folder) S.pendingFolder = { path: folder, name: folder.split("/").pop() };
 $("#input").value = task; autoGrow();
-// в тесте на запросы разрешения отвечаем «запретить» (при VENICE_AGENTTEST_DENY)
-const iv = deny ? setInterval(() => { for (const r of [...S.approvals.values()]) r(false); }, 300) : 0;
+// в тесте на запросы разрешения отвечаем «запретить» (при VENICE_AGENTTEST_DENY); с папкой — «разрешить»
+const iv = deny || folder ? setInterval(() => { for (const r of [...S.approvals.values()]) r(!deny); }, 300) : 0;
 await send();
 clearInterval(iv);
 const m = S.chat.messages.at(-1);
-const out = { steps: (m.steps || []).map(s => s.status + ": " + s.text), answer: (m.content || "").slice(0, 900), error: m.error || null, usage: m.usage || null };
+const out = { steps: (m.steps || []).map(s => s.status + ": " + s.text), plan: m.plan || null, answer: (m.content || "").slice(0, 1500), error: m.error || null, usage: m.usage || null };
 await api.remove(S.chat.id);
 S.settings.agent = before; saveSettings();
 return JSON.stringify(out);
@@ -79,6 +80,36 @@ r.aliveAfterStop = (await fetch("/api/key")).status === 200;
 const upd = await (await fetch("/api/update")).json();
 r.update = upd.current + (upd.available ? " → " + upd.latest : " (новее нет" + (upd.error ? ": " + upd.error : "") + ")");
 r.updateUI = typeof window.checkForUpdates === "function";
+// Папка проекта: поиск, чтение, правка с откатом, команды, защита от выхода за папку
+const fs = (op, body) => fetch("/api/fs/" + op, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root: fsRoot, ...body }) }).then(x => x.json());
+try {
+  const info = await fs("info", {});
+  r.fsInfo = info.files + " files, docs=" + (info.docs || []).map(d => d.name).join(",");
+  r.fsList = (await fs("list", { pattern: "**/*.js" })).files.join(";");
+  r.fsGrep = (await fs("grep", { query: "return 1" })).lines.join(";");
+  r.fsRead = (await fs("read", { path: "src/app.js", offset: 2, limit: 1 })).text;
+  const dry = await fs("edit", { path: "src/app.js", old: "return 1;", new: "return 2;", dry: true });
+  const ed = await fs("edit", { path: "src/app.js", old: "return 1;", new: "return 2;" });
+  const afterEdit = (await fs("read", { path: "src/app.js" })).text.includes("return 2;");
+  await fs("undo", { backup: ed.backup });
+  const afterUndo = (await fs("read", { path: "src/app.js" })).text.includes("return 1;");
+  r.fsEditUndo = dry.line === 2 && afterEdit && afterUndo;
+  r.fsAmbiguous = (await fs("edit", { path: "src/app.js", old: "n", new: "x" })).error?.slice(0, 30) || "НЕТ ОШИБКИ";
+  const wr = await fs("write", { path: "new/file.txt", content: "hi" });
+  r.fsWrite = wr.created === true && (await fs("read", { path: "new/file.txt" })).text === "1\thi";
+  r.fsOutside = (await fs("read", { path: "../../../etc/hosts" })).error?.slice(0, 30) || "НЕТ ОШИБКИ";
+  r.fsNotAllowed = (await fetch("/api/fs/read", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root: "/etc", path: "hosts" }) }).then(x => x.json())).error?.slice(0, 30) || "НЕТ ОШИБКИ";
+  const run = await fs("run", { command: "ls src && echo ok-$((2+2))" });
+  r.fsRun = run.code + " " + run.output.trim().replace(/\n/g, " | ");
+  const ac2 = new AbortController();
+  const slow = fetch("/api/fs/run", { method: "POST", signal: ac2.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root: fsRoot, command: "sleep 30" }) });
+  setTimeout(() => ac2.abort(), 1000);
+  const t0 = Date.now();
+  try { await slow; } catch {}
+  r.fsRunStop = Date.now() - t0 < 5000;
+  r.fsMemory = (await fs("memory", { add: "тест" })).notes.includes("тест");
+  r.fsUI = !!document.querySelector("#folderBtn") && typeof fsTool === "function" && FS_TOOLS.length === 8;
+} catch (e) { r.fsError = String(e); }
 return JSON.stringify(r);
 """#
 }
