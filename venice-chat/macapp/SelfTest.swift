@@ -109,7 +109,7 @@ try {
   try { await slow; } catch {}
   r.fsRunStop = Date.now() - t0 < 5000;
   r.fsMemory = (await fs("memory", { add: "тест" })).notes.includes("тест");
-  r.fsUI = !document.querySelector("#folderBtn") && !document.querySelector("#webBtn") && !!document.querySelector("#newProjectFolder") && typeof fsTool === "function" && FS_TOOLS.length === 13 && WEB_TOOLS.length === 1 && typeof webSearch === "function" && typeof undoAll === "function" && !document.querySelector("#agentBtn");
+  r.fsUI = !document.querySelector("#folderBtn") && !document.querySelector("#webBtn") && !!document.querySelector("#newProjectFolder") && typeof fsTool === "function" && FS_TOOLS.length === 13 && WEB_TOOLS.length === 1 && typeof webSearch === "function" && typeof undoAll === "function" && S.streams instanceof Map && typeof streamOf === "function" && !document.querySelector("#agentBtn");
   // правка по устаревшей копии не проходит; после правки видно, как место выглядит теперь
   const rd = await fs("read", { path: "src/app.js" });
   const ok1 = await fs("edit", { path: "src/app.js", old: "return 1;", new: "return 22;", expect: rd.version });

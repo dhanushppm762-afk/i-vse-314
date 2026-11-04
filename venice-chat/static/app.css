@@ -528,3 +528,5 @@ a.file-card:hover { border-color: var(--faint); }
 .change .diff { margin: 4px 0 8px; }
 .pp-folder { margin-bottom: 14px; }
 .pp-folder .pp-file .btn { font-size: 12.5px; padding: 4px 10px; white-space: nowrap; }
+.chat-item .wait { display: inline-flex; color: #d98a1f; margin-right: 6px; }
+.chat-item .wait svg { width: 14px; height: 14px; }

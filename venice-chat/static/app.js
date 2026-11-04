@@ -99,6 +99,13 @@ const api = {
   removeProject: id => fetch("/api/projects/" + id, { method: "DELETE" }),
 };
 
+// Ответы идут в нескольких чатах сразу: у каждого чата свой поток. S.stream — поток открытого чата.
+S.streams = new Map();   // id чата → { chat, msg, controller }
+const streamOf = chat => (chat && S.streams.get(chat.id)) || null;
+Object.defineProperty(S, "stream", { get: () => streamOf(S.chat) });
+// чат ждёт разрешения пользователя (для значка в списке чатов)
+const waitsApproval = id => !!S.streams.get(id)?.msg.steps?.some(st => st.status === "ask");
+
 function persist(chat) {
   chat.updated = Date.now();
   const meta = S.chats.find(c => c.id === chat.id);
@@ -183,7 +190,7 @@ function renderList() {
   for (const c of items) {
     const g = groupLabel(c.updated || 0);
     if (g !== last) { html += `<div class="group-label">${esc(g)}</div>`; last = g; }
-    const live = S.stream?.chat.id === c.id ? '<span class="dot"></span>' : "";
+    const live = waitsApproval(c.id) ? `<span class="wait" title="Ждёт вашего разрешения">${ICON.alert}</span>` : S.streams.has(c.id) ? '<span class="dot"></span>' : "";
     const proj = c.projectId && S.projects.find(p => p.id === c.projectId);
     const tag = proj ? `<span class="in-proj" title="Проект «${esc(proj.name)}»">${ICON.folder}</span>` : "";
     html += `<div class="chat-item${S.chat?.id === c.id ? " active" : ""}" data-id="${c.id}">${live}${tag}<span class="t">${esc(c.title || "Новый чат")}</span>` +
@@ -202,7 +209,7 @@ $("#chatList").addEventListener("click", async e => {
   if (act === "delete") {
     const meta = S.chats.find(c => c.id === id);
     if (!confirm(`Удалить чат «${meta?.title || "Новый чат"}»?`)) return;
-    if (S.stream?.chat.id === id) S.stream.controller.abort();
+    S.streams.get(id)?.controller.abort();
     await api.remove(id);
     S.chats = S.chats.filter(c => c.id !== id);
     S.cache.delete(id);
@@ -445,12 +452,14 @@ $("#thread").addEventListener("click", e => {
     case "deny": {
       const st = m.steps?.[+btn.dataset.k];
       S.approvals.get(st)?.(btn.dataset.act === "allow");
+      setTimeout(renderList, 50);
       break;
     }
     case "allow-all": {
       const st = m.steps?.[+btn.dataset.k];
       (S.chat.folderTrust ||= {})[st.kind] = true;
       S.approvals.get(st)?.(true);
+      setTimeout(renderList, 50);
       toast(st.kind === "run" ? "Команды в этом чате больше не будут спрашивать разрешения" : "Правки в этом чате больше не будут спрашивать разрешения (их можно отменить)");
       break;
     }
@@ -817,7 +826,7 @@ async function runImage(chat) {
   const msg = { role: "assistant", kind: "image", op: u.mode, model: u.params?.model, aspect: u.params?.aspect, images: [] };
   chat.messages.push(msg);
   const controller = new AbortController();
-  S.stream = { chat, msg, controller };
+  S.streams.set(chat.id, { chat, msg, controller });
   updateSendBtn();
   renderList();
   if (S.chat === chat) { renderThread(); scrollToBottom(true); }
@@ -844,7 +853,7 @@ async function runImage(chat) {
     if (e.name !== "AbortError") msg.error = e.message;
     else msg.error = "Остановлено";
   } finally {
-    S.stream = null;
+    S.streams.delete(chat.id);
     updateSendBtn();
     if (S.chat === chat) { renderThread(); if (S.stick) scrollToBottom(); }
     persist(chat);
@@ -898,7 +907,7 @@ async function runCompletion(chat) {
   const msg = { role: "assistant", content: "", reasoning: "" };
   chat.messages.push(msg);
   const controller = new AbortController();
-  S.stream = { chat, msg, controller };
+  S.streams.set(chat.id, { chat, msg, controller });
   updateSendBtn();
   renderList();
   if (S.chat === chat) { renderThread(); scrollToBottom(true); }
@@ -952,7 +961,7 @@ async function runCompletion(chat) {
       if (msg.usage.usd === null) { msg.usage.usd = textCost(chat.model, msg.usage.in, msg.usage.out); msg.usage.estimated = true; }
       logUsage({ kind: "text", model: chat.model, inTok: msg.usage.in, outTok: msg.usage.out, usd: msg.usage.usd, estimated: !!msg.usage.estimated });
     }
-    S.stream = null;
+    S.streams.delete(chat.id);
     updateSendBtn();
     if (S.chat === chat) { renderThread(); if (S.stick) scrollToBottom(); }
     persist(chat);
@@ -1649,6 +1658,9 @@ function askApproval(chat, msg, step, what) {
   step.status = "ask";
   step.text = `Нужно ваше разрешение: ${what}`;
   scheduleUpdate(chat, msg);
+  // вопрос ждёт, пока пользователь не ответит, даже если он ушёл в другой чат
+  renderList();
+  if (S.chat !== chat) toast(`Чат «${shortText(chat.title, 40)}» ждёт вашего разрешения`);
   return new Promise(resolve => {
     S.approvals.set(step, ok => { S.approvals.delete(step); resolve(ok); });
   });
@@ -1666,7 +1678,7 @@ async function runTool(call, chat, msg) {
     step.text = `Ищу в интернете: «${shortText(args.query, 60)}»`;
     scheduleUpdate(chat, msg);
     try {
-      const r = await webSearch(chat, String(args.query || ""), S.stream?.controller.signal);
+      const r = await webSearch(chat, String(args.query || ""), streamOf(chat)?.controller.signal);
       return done("ok", `Нашёл в интернете: «${shortText(args.query, 50)}»${r.count ? ` — ${plural(r.count, "источник", "источника", "источников")}` : ""}`, { text: r.text, usage: r.usage });
     } catch (e) {
       if (e.name === "AbortError") throw e;
@@ -1831,7 +1843,7 @@ async function runAgent(chat) {
   const msg = { role: "assistant", content: "", reasoning: "", steps: [] };
   chat.messages.push(msg);
   const controller = new AbortController();
-  S.stream = { chat, msg, controller };
+  S.streams.set(chat.id, { chat, msg, controller });
   updateSendBtn();
   renderList();
   if (S.chat === chat) { renderThread(); scrollToBottom(true); }
@@ -1840,7 +1852,7 @@ async function runAgent(chat) {
   const folder = folderOf(chat);
   const tools = [...(folder ? FS_TOOLS : []), ...WEB_TOOLS, ...(useBrowser ? BROWSER_TOOLS : []), ...(archives.length ? ARCHIVE_TOOLS : [])];
   // «Стоп» во время ожидания разрешения — считаем это отказом, чтобы цикл не завис
-  controller.signal.addEventListener("abort", () => { for (const resolve of [...S.approvals.values()]) resolve(false); });
+  controller.signal.addEventListener("abort", () => { for (const st of msg.steps) S.approvals.get(st)?.(false); });
   const total = { in: 0, out: 0, usd: 0, any: false };
   try {
     await prepareImages(chat);
@@ -1908,7 +1920,7 @@ async function runAgent(chat) {
   } catch (e) {
     if (e.name !== "AbortError") msg.error = e.message;
   } finally {
-    for (const resolve of S.approvals.values()) resolve(false);
+    for (const st of msg.steps) S.approvals.get(st)?.(false);
     // фоновые команды этого ответа не оставляем работать после него
     for (const job of msg.jobs || []) fsApi("job", { root: folder.path, job, stop: true }).catch(() => {});
     delete msg.jobs;
@@ -1918,7 +1930,7 @@ async function runAgent(chat) {
       msg.usage = { in: total.in, out: total.out, usd: total.usd };
       logUsage({ kind: "text", model: chat.model, inTok: total.in, outTok: total.out, usd: total.usd, note: folder ? "folder" : archives.length ? "archive" : "chat" });
     }
-    S.stream = null;
+    S.streams.delete(chat.id);
     updateSendBtn();
     if (S.chat === chat) { renderThread(); if (S.stick) scrollToBottom(); }
     persist(chat);
@@ -2151,7 +2163,7 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
     case "command_status": {
       step.text = `Проверяю фоновую команду ${args.job}`;
       scheduleUpdate(chat, msg);
-      const r = await fsApi("job", { root, job: args.job, wait: Math.min(+args.wait || 0, 60), stop: !!args.stop }, S.stream?.controller.signal);
+      const r = await fsApi("job", { root, job: args.job, wait: Math.min(+args.wait || 0, 60), stop: !!args.stop }, streamOf(chat)?.controller.signal);
       if (r.output.trim()) step.output = r.output.trim().split("\n").slice(-6).join("\n");
       const state = r.running ? "ещё идёт" : r.stopped ? "остановлена" : r.code === 0 ? "завершилась успешно" : `завершилась с ошибкой (код ${r.code})`;
       return { status: r.running || r.stopped || r.code === 0 ? "ok" : "err", label: `Фоновая команда ${r.job} ${state}: ${shortText(r.command, 50)}`,
@@ -2217,7 +2229,7 @@ async function runExplore(chat, msg, step, task) {
 ${map?.map ? `\nКарта кода${map.truncated ? " (неполная)" : ""}:\n${map.map}` : ""}` }, { role: "user", content: task }];
   const usage = { in: 0, out: 0, usd: 0 };
   const add = u => { if (!u) return; usage.in += u.in; usage.out += u.out; usage.usd += u.usd ?? textCost(model, u.in, u.out) ?? 0; };
-  const controller = S.stream?.controller || new AbortController();
+  const controller = streamOf(chat)?.controller || new AbortController();
   let steps = 0;
   for (let i = 0; i <= EXPLORE_STEPS; i++) {
     const last = i === EXPLORE_STEPS;
@@ -2929,7 +2941,7 @@ function showUpdateCard(info) {
       setTimeout(() => card.remove(), 300);
     }
     if (act === "install") {
-      if (S.stream) return toast("Дождитесь окончания ответа");
+      if (S.streams.size) return toast("Дождитесь окончания ответов во всех чатах");
       const btn = e.target.closest("button"), err = $(".u-err", card);
       btn.disabled = true; btn.textContent = "Скачиваю…"; err.hidden = true;
       try {
