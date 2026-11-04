@@ -17,6 +17,24 @@ SKIP_DIRS = {"node_modules", ".git", ".svn", ".hg", "vendor", ".venv", "venv", "
              ".next", ".nuxt", ".pnpm-store", ".worktrees", "dist", "build", "out", "coverage", ".build", "target"}
 MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "README.md"]
 MAX_FILE_BYTES = 2 * 1024 * 1024
+# Карта кода: шаблоны объявлений (имя — в группе n); те же, что в Workspace.swift
+SYMBOL_PATTERNS = [re.compile(p) for p in [
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?P<n>[\w$]+)",
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(?P<n>[\w$]+)",
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<n>[\w$]+)\s*=\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>|[\w$]+\s*=>)",
+    r"^\s*(?:export\s+)?(?:declare\s+)?(?:interface|type|enum)\s+(?P<n>[\w$]+)",
+    r"^\s*(?:async\s+)?def\s+(?P<n>[\w?!]+)",
+    r"^\s*(?:class|module)\s+(?P<n>[\w:]+)",
+    r"^\s*(?:(?:public|private|fileprivate|internal|open|static|final|override|mutating|nonisolated|@\w+)\s+)*(?:func|struct|enum|protocol|extension|actor)\s+(?P<n>\w+)",
+    r"^func\s+(?:\([^)]*\)\s*)?(?P<n>\w+)",
+    r"^type\s+(?P<n>\w+)",
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|mod)\s+(?P<n>\w+)",
+    r"^\s*(?:(?:public|private|protected|static|final|abstract|internal|open|data|sealed|override)\s+)*(?:interface|object|fun|record)\s+(?P<n>\w+)",
+    r"^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*function\s+(?P<n>\w+)",
+    r"^\s{2,4}(?:static\s+)?(?:async\s+)?(?:get\s+|set\s+)?(?P<n>[A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*$",
+]]
+CODE_EXT = {"js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "py", "rb", "go", "rs", "swift", "kt", "kts", "java", "cs", "php", "scala", "dart", "lua", "m", "mm"}
+SKIP_NAMES = {"if", "for", "while", "switch", "catch", "function", "return", "else", "do", "try", "with", "elif", "super", "await", "new", "typeof"}
 MAX_OUTPUT = 60_000
 
 
@@ -143,7 +161,8 @@ class Workspace:
             return {"path": full, "name": Path(full).name}
         r = self.root(body)
         fn = {"info": self.info, "list": self.list, "grep": self.grep, "read": self.read, "write": self.write,
-              "edit": self.edit, "undo": self.undo, "run": self.run, "memory": self.memory}.get(op)
+              "edit": self.edit, "undo": self.undo, "run": self.run, "memory": self.memory,
+              "symbols": self.symbols}.get(op)
         if not fn:
             raise FsError(f"Нет такой операции: {op}")
         return fn(r, body)
@@ -337,6 +356,48 @@ class Workspace:
         if len(text) > MAX_OUTPUT:
             text = text[:MAX_OUTPUT // 3] + f"\n…[вывод сокращён: {len(text)} символов]…\n" + text[-MAX_OUTPUT * 2 // 3:]
         return {"code": code, "output": text, "timedOut": timed_out}
+
+    @staticmethod
+    def file_symbols(text):
+        out = []
+        for i, line in enumerate(text.split("\n")):
+            if len(line) >= 400:
+                continue
+            for rx in SYMBOL_PATTERNS:
+                m = rx.match(line)
+                if m:
+                    if m.group("n") not in SKIP_NAMES:
+                        out.append(f"{m.group('n')}:{i + 1}")
+                    break
+            if len(out) >= 80:
+                break
+        return out
+
+    def symbols(self, r, body):
+        d = self.resolve(r, body.get("dir"))
+        glob = str(body.get("glob") or "").strip()
+        grx = self.glob_re(glob) if glob else None
+        max_chars = max(2000, min(int(body.get("maxChars") or 30000), 120000))
+        lines, chars, files, truncated = [], 0, 0, False
+        for p, s in self.walk(d):
+            if s > 600_000 or p.suffix.lower().lstrip(".") not in CODE_EXT:
+                continue
+            rp = self.rel(r, p)
+            if not self.matches(grx, glob, rp):
+                continue
+            try:
+                text = self.read_text(p)
+            except Exception:
+                continue
+            files += 1
+            syms = self.file_symbols(text)
+            row = f"{rp} ({text.count(chr(10)) + 1} стр.)" + (": " + ", ".join(syms) if syms else "")
+            if chars + len(row) > max_chars:
+                truncated = True
+                break
+            chars += len(row) + 1
+            lines.append(row)
+        return {"map": "\n".join(lines), "files": files, "truncated": truncated}
 
     def memory(self, r, body):
         self.memory_dir.mkdir(parents=True, exist_ok=True)

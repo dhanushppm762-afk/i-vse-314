@@ -109,7 +109,9 @@ try {
   try { await slow; } catch {}
   r.fsRunStop = Date.now() - t0 < 5000;
   r.fsMemory = (await fs("memory", { add: "тест" })).notes.includes("тест");
-  r.fsUI = !!document.querySelector("#folderBtn") && typeof fsTool === "function" && FS_TOOLS.length === 8;
+  r.fsUI = !!document.querySelector("#folderBtn") && typeof fsTool === "function" && FS_TOOLS.length === 12 && !document.querySelector("#agentBtn");
+  const sym = await fs("symbols", {});
+  r.fsSymbols = sym.files + " file(s): " + sym.map;
 } catch (e) { r.fsError = String(e); }
 return JSON.stringify(r);
 """#

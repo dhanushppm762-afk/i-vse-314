@@ -95,6 +95,7 @@ final class Workspace {
                 case "undo": out = try undo(r, body)
                 case "run": out = try run(r, body, id: id)
                 case "memory": out = memory(r, body)
+                case "symbols": out = try symbols(r, body)
                 default: throw FsError("Нет такой операции: \(op)")
                 }
                 b.json(t, 200, out)
@@ -390,6 +391,62 @@ final class Workspace {
             text = String(text.prefix(maxOutput / 3)) + "\n…[вывод сокращён: \(text.count) символов]…\n" + String(text.suffix(maxOutput * 2 / 3))
         }
         return ["code": p.terminationStatus, "output": text, "timedOut": timedOut]
+    }
+
+    // MARK: карта кода — функции, классы и типы по файлам (как repo map у помощников для кода)
+
+    static let symbolPatterns: [NSRegularExpression] = [
+        #"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?<n>[\w$]+)"#,
+        #"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(?<n>[\w$]+)"#,
+        #"^\s*(?:export\s+)?(?:const|let|var)\s+(?<n>[\w$]+)\s*=\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>|[\w$]+\s*=>)"#,
+        #"^\s*(?:export\s+)?(?:declare\s+)?(?:interface|type|enum)\s+(?<n>[\w$]+)"#,
+        #"^\s*(?:async\s+)?def\s+(?<n>[\w?!]+)"#,
+        #"^\s*(?:class|module)\s+(?<n>[\w:]+)"#,
+        #"^\s*(?:(?:public|private|fileprivate|internal|open|static|final|override|mutating|nonisolated|@\w+)\s+)*(?:func|struct|enum|protocol|extension|actor)\s+(?<n>\w+)"#,
+        #"^func\s+(?:\([^)]*\)\s*)?(?<n>\w+)"#,
+        #"^type\s+(?<n>\w+)"#,
+        #"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|mod)\s+(?<n>\w+)"#,
+        #"^\s*(?:(?:public|private|protected|static|final|abstract|internal|open|data|sealed|override)\s+)*(?:interface|object|fun|record)\s+(?<n>\w+)"#,
+        #"^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*function\s+(?<n>\w+)"#,
+        #"^\s{2,4}(?:static\s+)?(?:async\s+)?(?:get\s+|set\s+)?(?<n>[A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*$"#
+    ].compactMap { try? NSRegularExpression(pattern: $0, options: [.anchorsMatchLines]) }
+    static let codeExt: Set<String> = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "py", "rb", "go", "rs", "swift", "kt", "kts", "java", "cs", "php", "scala", "dart", "lua", "m", "mm"]
+    static let skipNames: Set<String> = ["if", "for", "while", "switch", "catch", "function", "return", "else", "do", "try", "with", "elif", "super", "await", "new", "typeof"]
+
+    static func fileSymbols(_ text: String) -> [String] {
+        var out: [String] = []
+        for (i, line) in text.components(separatedBy: "\n").enumerated() where line.count < 400 {
+            let range = NSRange(line.startIndex..., in: line)
+            for re in symbolPatterns {
+                guard let m = re.firstMatch(in: line, range: range), let r = Range(m.range(withName: "n"), in: line) else { continue }
+                let name = String(line[r])
+                if !skipNames.contains(name) { out.append("\(name):\(i + 1)") }
+                break
+            }
+            if out.count >= 80 { break }
+        }
+        return out
+    }
+
+    private func symbols(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
+        let dir = try resolve(r, body["dir"])
+        let glob = (body["glob"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        let gre = glob.isEmpty ? nil : Self.globRegex(glob)
+        let maxChars = max(2000, min(body["maxChars"] as? Int ?? 30_000, 120_000))
+        var lines: [String] = [], chars = 0, files = 0, truncated = false
+        walk(r, under: dir) { url, size in
+            guard size <= 600_000, Self.codeExt.contains(url.pathExtension.lowercased()) else { return true }
+            let p = rel(r, url)
+            guard matches(gre, glob, p), let text = try? readText(url) else { return true }
+            files += 1
+            let syms = Self.fileSymbols(text)
+            let row = "\(p) (\(text.components(separatedBy: "\n").count) стр.)" + (syms.isEmpty ? "" : ": " + syms.joined(separator: ", "))
+            if chars + row.count > maxChars { truncated = true; return false }
+            chars += row.count + 1
+            lines.append(row)
+            return true
+        }
+        return ["map": lines.joined(separator: "\n"), "files": files, "truncated": truncated]
     }
 
     // Заметки модели о проекте — хранятся у приложения, в папку пользователя не пишутся
