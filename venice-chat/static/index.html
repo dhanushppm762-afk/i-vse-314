@@ -30,6 +30,9 @@
     <div class="side-scroll">
       <div class="side-title">
         <span>Проекты</span>
+        <button class="icon-btn" id="newProjectFolder" title="Новый проект из папки на компьютере">
+          <svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/><path d="M12 11v6M9 14h6"/></svg>
+        </button>
         <button class="icon-btn" id="newProject" title="Новый проект">
           <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
         </button>
@@ -80,14 +83,6 @@
               <svg viewBox="0 0 24 24"><path d="M15 4l5 5L9 20H4v-5z"/><path d="M12.5 6.5l5 5"/></svg><span>Редактор</span>
             </button>
           </div>
-          <button id="webBtn" class="toggle" title="Разрешить модели искать в интернете">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
-            <span>Поиск</span>
-          </button>
-          <button id="folderBtn" class="toggle" title="Открыть папку проекта">
-            <svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>
-            <span>Папка</span>
-          </button>
           <div class="spacer"></div>
           <select id="aspect" class="mini" title="Соотношение сторон" hidden></select>
           <select id="resolution" class="mini" title="Разрешение" hidden></select>

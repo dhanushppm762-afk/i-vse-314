@@ -175,7 +175,7 @@ def list_items(folder, fields):
 
 
 CHAT_FIELDS = ("id", "title", "created", "updated", "model", "projectId", "pinned")
-PROJECT_FIELDS = ("id", "name", "description", "created", "updated")
+PROJECT_FIELDS = ("id", "name", "description", "created", "updated", "folder")
 
 
 # ---------- /api/fetch ----------

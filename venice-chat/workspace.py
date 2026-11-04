@@ -38,6 +38,14 @@ SYMBOL_PATTERNS = [re.compile(p) for p in [
 CODE_EXT = {"js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "py", "rb", "go", "rs", "swift", "kt", "kts", "java", "cs", "php", "scala", "dart", "lua", "m", "mm"}
 SKIP_NAMES = {"if", "for", "while", "switch", "catch", "function", "return", "else", "do", "try", "with", "elif", "super", "await", "new", "typeof"}
 MAX_OUTPUT = 60_000
+STALE = ("Файл {path} изменился после того, как ты его прочитал (его поменял пользователь, команда или форматировщик). "
+         "Правка НЕ применена. Перечитай нужное место через read_file и повтори правку по свежему тексту.")
+
+
+def file_version(p: Path):
+    """Отметка версии файла: время изменения (мкс) и размер. Если она другая — файл меняли."""
+    st = p.stat()
+    return f"{st.st_mtime_ns // 1000}-{st.st_size}"
 
 
 class FsError(Exception):
@@ -75,7 +83,7 @@ class Workspace:
             raise FsError("Папка проекта не выбрана")
         p = Path(r).resolve()
         if str(p) not in self.allowed():
-            raise FsError(f"Нет доступа к папке {r}: выберите её кнопкой «Папка»")
+            raise FsError(f"Нет доступа к папке {r}: подключите её к проекту заново")
         if not p.is_dir():
             raise FsError(f"Папки {r} больше нет")
         return p
@@ -278,7 +286,27 @@ class Workspace:
             if chars > 120_000 and out:
                 break
             out.append(row); last = i + 1
-        return {"path": self.rel(r, p), "text": "\n".join(out), "from": start, "to": last, "total": len(lines)}
+        return {"path": self.rel(r, p), "text": "\n".join(out), "from": start, "to": last, "total": len(lines),
+                "version": file_version(p)}
+
+    def check_fresh(self, r, p, body):
+        """Не даём править файл по устаревшей копии: expect — версия, которую модель видела при чтении."""
+        if not p.exists():
+            return
+        exp = str(body.get("expect") or "")
+        if exp and file_version(p) != exp:
+            raise FsError(STALE.format(path=self.rel(r, p)))
+        if body.get("mustBeNew"):
+            raise FsError(f"Файл {self.rel(r, p)} уже есть, а ты его не читал. Прочитай его через read_file "
+                          "и правь через edit_file — иначе можно затереть чужие изменения.")
+
+    @staticmethod
+    def snippet(text, line, new):
+        """Как выглядит место правки теперь: несколько строк вокруг, с номерами."""
+        lines = text.split("\n")
+        lo = max(1, line - 3)
+        hi = min(len(lines), line + new.count("\n") + 3, lo + 39)
+        return "\n".join(f"{i}\t{lines[i - 1][:300]}" for i in range(lo, hi + 1))
 
     def backup(self, r, p):
         bid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
@@ -294,6 +322,7 @@ class Workspace:
         p = self.resolve(r, body.get("path"))
         if p == r:
             raise FsError("Укажи путь к файлу")
+        self.check_fresh(r, p, body)
         old = None
         if p.exists():
             try:
@@ -303,7 +332,7 @@ class Workspace:
         bid = self.backup(r, p)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(str(body.get("content") or ""), encoding="utf-8")
-        return {"backup": bid, "created": old is None, "old": old or "", "path": self.rel(r, p)}
+        return {"backup": bid, "created": old is None, "old": old or "", "path": self.rel(r, p), "version": file_version(p)}
 
     def edit(self, r, body):
         p = self.resolve(r, body.get("path"))
@@ -312,6 +341,7 @@ class Workspace:
         old, new = str(body.get("old") or ""), str(body.get("new") or "")
         if not old:
             raise FsError("Пустой old — укажи точный кусок текста, который нужно заменить")
+        self.check_fresh(r, p, body)
         text = self.read_text(p)
         n = text.count(old)
         if n == 0:
@@ -325,7 +355,8 @@ class Workspace:
         updated = text.replace(old, new) if allm else text.replace(old, new, 1)
         bid = self.backup(r, p)
         p.write_text(updated, encoding="utf-8")
-        return {"backup": bid, "replaced": n if allm else 1, "line": line, "path": self.rel(r, p)}
+        return {"backup": bid, "replaced": n if allm else 1, "line": line, "path": self.rel(r, p),
+                "version": file_version(p), "snippet": self.snippet(updated, line, new)}
 
     def undo(self, r, body):
         bid = str(body.get("backup") or "").replace("/", "")
@@ -412,7 +443,10 @@ class Workspace:
         try:
             proc.wait(timeout=3)
         except Exception:
-            pass
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
 
     def stop_all_jobs(self):
         for job in self.jobs.values():
@@ -426,13 +460,20 @@ class Workspace:
         timeout = max(5, min(int(body.get("timeout") or 120), 900))
         shell, env = self.shell_env()
         timed_out = False
+        # своя группа процессов: по таймауту останавливаем и всё, что команда запустила
+        proc = subprocess.Popen([shell, "-lc", cmd], cwd=r, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            proc = subprocess.run([shell, "-lc", cmd], cwd=r, env=env, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-            data, code = proc.stdout, proc.returncode
-        except subprocess.TimeoutExpired as e:
-            data, code, timed_out = e.stdout or b"", -1, True
-        text = data.decode("utf-8", errors="replace")
+            data, _ = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out, code = True, -1
+            self.stop_tree(proc)
+            try:
+                data, _ = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                data = b""
+        text = (data or b"").decode("utf-8", errors="replace")
         if len(text) > MAX_OUTPUT:
             text = text[:MAX_OUTPUT // 3] + f"\n…[вывод сокращён: {len(text)} символов]…\n" + text[-MAX_OUTPUT * 2 // 3:]
         return {"code": code, "output": text, "timedOut": timed_out}
