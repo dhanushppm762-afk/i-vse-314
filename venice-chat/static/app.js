@@ -866,7 +866,9 @@ function toApi(m) {
   if (OP_LABEL[m.mode]) return { role: "user", content: `(${OP_LABEL[m.mode]}) ${m.content || ""}`.trim() };
   let content = m.role === "assistant" ? splitThink(m).content : m.content;
   const acts = (m.steps || []).filter(st => st.status !== "note" && st.status !== "plan");
-  if (acts.length) content = `${content}\n\n[Твои действия: ${acts.map(st => st.text + (st.undone ? " (пользователь отменил)" : "")).join("; ")}]`.trim();
+  const actText = st => st.text + (st.undone ? " (пользователь отменил)" : "");
+  if (m.workNote) content = `${content}\n\n[Сводка твоей работы в этом ответе (ответ прервался, продолжай с этого места):\n${m.workNote}]`.trim();
+  else if (acts.length) content = `${content}\n\n[Твои действия: ${acts.length > 30 ? `…ещё ${acts.length - 30} раньше; ` : ""}${acts.slice(-30).map(actText).join("; ")}]`.trim();
   if (!m.files?.length) return { role: m.role, content };
   let text = content || "";
   for (const f of m.files) {
@@ -1883,12 +1885,15 @@ async function runAgent(chat) {
       total.in += u.in; total.out += u.out; total.any = true;
       total.usd += u.usd ?? textCost(chat.model, u.in, u.out) ?? 0;
     };
+    const seen = new Map();   // одинаковые вызовы: подпись → сколько раз
+    let stopped = false;       // ответ прервался по лимиту шагов или денег — тогда сохраним сводку работы
     for (let step = 0; step < MAX_STEPS; step++) {
       const turn = await agentTurn(chat, msg, convo, controller, tools);
       add(turn.usage);
       if (!turn.calls.length) break;
       if (total.usd >= budget) {
         msg.content = (turn.content || "").trim() + `\n\n_Остановился: на эту задачу потрачено $${total.usd.toFixed(2)} (лимит $${budget} — меняется в настройках). Напишите «продолжай», чтобы продолжить._`;
+        stopped = true;
         break;
       }
       // промежуточные пояснения модели («сейчас открою…») — в список шагов, в ответе останется только итог
@@ -1896,25 +1901,43 @@ async function runAgent(chat) {
       msg.content = "";
       convo.push({ role: "assistant", content: turn.content || "", tool_calls: turn.calls.map(c => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })) });
       // чтения и поиски — одновременно; всё, что меняет файлы или браузер, — по очереди
-      const parallel = turn.calls.length > 1 && turn.calls.every(c => PARALLEL_TOOLS.has(c.name));
+      const parallel = turn.calls.length > 1 && turn.calls.every(c => PARALLEL_TOOLS.has(c.name) || (c.name === "run_command" && safeCall(c)));
       const ready = parallel ? await Promise.all(turn.calls.map(c => runTool(c, chat, msg))) : [];
       for (const [k, call] of turn.calls.entries()) {
         if (controller.signal.aborted) throw new DOMException("stop", "AbortError");
         const result = parallel ? ready[k] : await runTool(call, chat, msg);
         add(result.usage);
+        // одно и то же в третий раз — напоминаем, что это уже было
+        const sig = call.name + " " + (call.args || "").replace(/\s+/g, " ");
+        const times = (seen.get(sig) || 0) + 1;
+        seen.set(sig, times);
+        if (times >= 3 && READ_LIKE.has(call.name)) result.text += `\n\n[Приложение: ты делаешь этот же вызов уже ${times}-й раз. Если ничего не менялось — не повторяй, используй то, что уже знаешь, и переходи к делу.]`;
+
         convo.push({ role: "tool", tool_call_id: call.id, content: result.text, tool: call.name,
           kind: call.name.startsWith("browser_") ? "browser" : call.name.startsWith("archive_") ? "archive" : call.name === "web_search" ? "web" : "fs" });
         if (result.image) convo.push({ role: "user", screenshot: true, content: [{ type: "text", text: call.name === "archive_view_image" ? "Картинка из архива:" : "Снимок экрана браузера:" }, { type: "image_url", image_url: { url: result.image } }] });
       }
       shrinkHistory(convo);
       maskOldResults(convo);
+      // каждые 40 шагов — проверка курса: что из просьбы сделано, что осталось (так модель не уходит в лишнее)
+      if (folder && step > 0 && step % CHECKPOINT === 0) {
+        convo.push({ role: "user", content: `[Приложение] Уже ${step} шагов. Остановись на секунду и проверь: что из просьбы пользователя уже сделано и что осталось? Делай только оставшееся, без лишних проверок и улучшений, о которых не просили. Если основное готово — заканчивай и коротко отчитайся. Если ходишь по кругу — смени подход (например, один скрипт вместо многих правок) или скажи пользователю, что мешает.` });
+        msg.steps.push({ status: "note", text: `${step} шагов — приложение попросило модель сверить работу с задачей` });
+      }
       if (folder && turn.usage?.in > ctxLimit && convo.length > keep + 4) {
         const st = { status: "run", text: "Контекст заполнен — сжимаю историю работы, чтобы продолжить" };
         msg.steps.push(st); scheduleUpdate(chat, msg);
         add(await compactConvo(chat, convo, keep, controller));
         st.status = "ok"; st.text = "Сжал историю работы и продолжаю";
       }
-      if (step === MAX_STEPS - 1) msg.content += "\n\n_Остановился: слишком много шагов подряд. Напишите «продолжай», если нужно._";
+      if (step === MAX_STEPS - 1) { msg.content += "\n\n_Остановился: слишком много шагов подряд. Напишите «продолжай», если нужно._"; stopped = true; }
+    }
+    // ответ прервался — модель пишет сводку, и «продолжай» начнёт с того же места, а не изучит всё заново
+    if (stopped && folder && convo.length > keep + 2) {
+      const st = { status: "run", text: "Сохраняю сводку работы, чтобы продолжить с этого места" };
+      msg.steps.push(st); scheduleUpdate(chat, msg);
+      try { const r = await workSummary(chat, convo, controller, "Ответ сейчас прервётся, пользователь напишет «продолжай»."); msg.workNote = r.text; add(r.usage); st.status = "ok"; st.text = "Сохранил сводку работы — «продолжай» начнёт с этого места"; }
+      catch (e) { if (e.name === "AbortError") throw e; st.status = "err"; st.text = "Сводку сохранить не удалось"; }
     }
     if (!msg.content.trim() && !msg.steps.length) msg.error = "Модель вернула пустой ответ.";
   } catch (e) {
@@ -2014,11 +2037,24 @@ function isSafeCommand(cmd) {
   return SAFE_CMD.test(c);
 }
 
+// что считается «чтением» для подсказки о повторах, и что — изменением файлов
+const READ_LIKE = new Set(["list_files", "grep", "read_file", "code_map", "find_symbol", "run_command", "browser_screenshot", "browser_read", "archive_read", "web_search"]);
+const CHECKPOINT = 40;
+const LEFT_RUNNING = /(^|[^&>|])&\s*($|;|\n|\))|\bnohup\b|\bdisown\b/;
+const safeCall = c => { try { const a = JSON.parse(c.args || "{}"); return !a.background && isSafeCommand(a.command); } catch { return false; } };
+
 const folderRules = (folder, info, browser) => {
   const top = Object.entries(info.top || {}).sort((a, b) => b[1] - a[1]);
   const lines = [`Ты работаешь с проектом в папке «${info.name}» (${info.path}) на компьютере пользователя: ${plural(info.files, "файл", "файла", "файлов")}${info.git ? ", git-репозиторий" : ""}.
 В корне: ${(info.entries || []).slice(0, 80).join(", ")}${(info.entries || []).length > 80 ? "…" : ""}
 Файлов по папкам: ${top.slice(0, 25).map(([k, v]) => `${k} — ${v}`).join(", ")}
+
+Главное:
+- Делай ровно то, что просил пользователь, самым простым способом, который даёт нужный результат. Не добавляй своих целей: попиксельное совпадение, скачивание шрифтов и библиотек, переделка того, о чём не просили, «улучшения на всякий случай». Сомневаешься, нужен ли шаг, — не делай его, а в итоге предложи одной строкой.
+- Изучай ровно столько, сколько нужно, чтобы начать: обычно это 5–15 шагов, а не десятки. Потом действуй. Написал «сейчас соберу/исправлю» — делай это в этом же шаге, не уходи снова проверять.
+- Не читай повторно то, что уже видел, если файл не менялся, — опирайся на то, что знаешь.
+- Большой файл (тысячи строк или сотни КБ, например сохранённая страница) не читай кусками по много раз. Посмотри структуру (grep по тегам, начало файла), затем напиши ОДИН скрипт (python3), который сделает всё преобразование целиком, запусти его и проверь результат выборочно (размер, grep, пара мест). Не получилось — поправь этот же скрипт, не начинай заново.
+- Результат клади туда, куда просил пользователь; если не сказано — меняй файлы на месте (копию для отката приложение делает само) или в одну папку результата. Черновики и временные файлы удаляй в конце.
 
 Как работать (как опытный разработчик):
 - Сначала разберись, потом меняй. Карта кода ниже показывает, где какие функции; ищи через grep, find_symbol и list_files, читай только нужные файлы и места (read_file с offset). Не угадывай содержимое файлов и не выдумывай функции — проверь.
@@ -2037,10 +2073,10 @@ const folderRules = (folder, info, browser) => {
 - В начале крупной задачи посмотри git status. Если рабочая копия чистая — создай под задачу отдельную ветку (git switch -c короткое-имя-латиницей) и упомяни это в плане. Если там уже есть чужие незакоммиченные изменения — ветку не создавай и не коммить, просто скажи об этом в итоге.
 - Когда задача сделана и проверена — сделай коммит только своих файлов (git add путь… и git commit -m "…") с понятным описанием на языке пользователя: первая строка — что сделано, ниже — зачем и как проверено. Мелкие правки в одну-две строки коммить, только если пользователь просит.
 - Никогда не делай git push, reset --hard, rebase, checkout чужих файлов, force и не удаляй ветки без прямой просьбы пользователя.`);
-  if (browser) lines.push(`Проверка глазами: если ты менял сайт или веб-интерфейс, посмотри на результат сам.
-- Запусти проект в фоне: run_command с background=true (dev-сервер из package.json, например npm run dev; простой сайт без сборки — python3 -m http.server 8000).
-- Дождись в выводе адреса (command_status с wait 5–10), открой его через browser_open с http:// (например http://localhost:5173), посмотри browser_screenshot и при необходимости поправь.
-- В конце останови сервер: command_status со stop=true.`);
+  if (browser) lines.push(`Проверка глазами — один раз в конце, если ты менял внешний вид сайта:
+- Запусти сайт в фоне (run_command с background=true: dev-сервер из package.json или python3 -m http.server 8000 для простого сайта), открой адрес через browser_open с http://, сделай один browser_screenshot (при необходимости — ещё один после прокрутки).
+- Без попиксельных сравнений, эталонных снимков и измерений. Если что-то явно сломано — поправь и посмотри ещё раз, не больше.
+- Остановить сервер: command_status со stop=true.`);
   if (info.map) lines.push(`Карта кода (файл (строк): имя:строка, …)${info.mapTruncated ? " — НЕПОЛНАЯ, остальное смотри через code_map с dir" : ""}:\n${info.map}`);
   for (const d of info.docs || []) lines.push(`Файл ${d.name} из проекта${d.name === "README.md" ? " (начало)" : " — инструкции проекта, следуй им"}:\n<file name="${d.name}">\n${d.text}\n</file>`);
   if (info.notes?.trim()) lines.push(`Твои заметки об этом проекте с прошлых раз (remember):\n${info.notes.trim()}`);
@@ -2143,6 +2179,7 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
     case "run_command": {
       step.text = `Выполняю: ${shortText(args.command, 70)}`;
       step.where = args.command;
+      if (!args.background && LEFT_RUNNING.test(String(args.command || ""))) return { status: "err", label: `Не запущено: ${shortText(args.command, 50)}`, text: "Не запускай процессы через & или nohup: они остаются работать после команды. Для сервера или долгой команды вызови run_command с background=true (без &), а останови через command_status со stop=true." };
       if (!(isSafeCommand(args.command) && !args.background) && !await ask(`выполнить команду в папке «${folder.name}»`, "run")) return { status: "denied", label: `Вы запретили команду ${shortText(args.command, 50)}`, text: "Пользователь запретил эту команду." };
       step.status = "run";
       scheduleUpdate(chat, msg);
@@ -2253,18 +2290,24 @@ ${map?.map ? `\nКарта кода${map.truncated ? " (неполная)" : ""}
 
 // Сжатие разговора, когда он разросся: модель пишет сводку, и работа продолжается с неё.
 // Так длинная задача не упирается в лимит и не дорожает с каждым шагом.
-async function compactConvo(chat, convo, keep, controller) {
-  const ask = { role: "user", content: `Контекст разговора почти заполнен. Напиши подробную сводку проделанной работы для себя же, чтобы продолжить без потерь:
-1) исходная задача пользователя и его уточнения; 2) что уже сделано (какие файлы изменены и как); 3) важные находки: пути, имена функций, как устроен код, команды проверки; 4) что осталось сделать, следующий шаг. Только сводка, без вступлений.` };
+// Модель пишет сводку своей работы: для сжатия контекста и чтобы «продолжай» начинал с того же места
+async function workSummary(chat, convo, controller, why) {
+  const ask = { role: "user", content: `${why} Напиши сводку проделанной работы для себя же, чтобы продолжить без потерь:
+1) исходная задача пользователя и его уточнения; 2) что уже сделано (какие файлы созданы и изменены, какие скрипты написаны и где лежат); 3) важные находки: пути, имена, как устроен код, команды проверки; 4) что осталось сделать — конкретный следующий шаг. Не повторяй то, что уже проверено. Только сводка, без вступлений.` };
   const body = requestBody(chat, [...convo.map(apiMsg), ask], { stream: false });
   delete body.stream_options;
   const res = await fetch("/api/chat", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(readError(await res.text()));
   const j = await res.json();
-  const summary = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content.trim();
-  if (!summary) throw new Error("не удалось сжать разговор");
-  convo.splice(keep, convo.length - keep, { role: "user", content: `[Сводка твоей работы до этого момента — контекст был сжат]\n${summary}\n\nПродолжай задачу с того места, где остановился.` });
-  return { in: j.usage?.prompt_tokens || 0, out: j.usage?.completion_tokens || 0, usd: j.cost?.usd ?? null };
+  const text = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content.trim();
+  if (!text) throw new Error("не удалось составить сводку");
+  return { text, usage: { in: j.usage?.prompt_tokens || 0, out: j.usage?.completion_tokens || 0, usd: j.cost?.usd ?? null } };
+}
+
+async function compactConvo(chat, convo, keep, controller) {
+  const r = await workSummary(chat, convo, controller, "Контекст разговора почти заполнен.");
+  convo.splice(keep, convo.length - keep, { role: "user", content: `[Сводка твоей работы до этого момента — контекст был сжат]\n${r.text}\n\nПродолжай задачу с того места, где остановился.` });
+  return r.usage;
 }
 
 function planHtml(m, live) {
