@@ -56,9 +56,6 @@
         <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4z"/></svg>
       </button>
       <div id="chatTitle"></div>
-      <button class="icon-btn" id="browserBtn" title="Показать или скрыть браузер (Cmd+B)" hidden>
-        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M15 4v16"/></svg>
-      </button>
       <select id="chatProject" class="mini" title="Проект, к которому относится этот чат" hidden></select>
     </header>
 
@@ -86,10 +83,6 @@
           <button id="webBtn" class="toggle" title="Разрешить модели искать в интернете">
             <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
             <span>Поиск</span>
-          </button>
-          <button id="agentBtn" class="toggle" title="Модель сама работает в браузере: открывает сайты, читает, нажимает" hidden>
-            <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/><path d="M10.5 13l3 2-3 2z"/></svg>
-            <span>Браузер</span>
           </button>
           <button id="folderBtn" class="toggle" title="Открыть папку проекта">
             <svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>
@@ -173,6 +166,10 @@
     <label class="check">
       <input type="checkbox" id="setVeniceSystem">
       <span>Добавлять системный промпт Venice <small>(встроенная инструкция сервиса)</small></span>
+    </label>
+    <label class="check" id="setBrowserToolRow" hidden>
+      <input type="checkbox" id="setBrowserTool">
+      <span>Модель может открывать сайты во встроенном браузере <small>(панель справа появится сама, когда это понадобится)</small></span>
     </label>
     <label class="check">
       <input type="checkbox" id="setReadLinks">

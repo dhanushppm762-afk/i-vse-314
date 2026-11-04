@@ -1376,6 +1376,8 @@ $("#settingsBtn").onclick = () => {
   $("#setSystem").value = S.settings.system;
   $("#setVeniceSystem").checked = S.settings.veniceSystem;
   $("#setReadLinks").checked = S.settings.readLinks !== false;
+  $("#setBrowserToolRow").hidden = !nativeBrowser;
+  $("#setBrowserTool").checked = S.settings.browserTool !== false;
   $("#setBudget").value = +S.settings.agentBudget > 0 ? S.settings.agentBudget : 1;
   $("#setSafeMode").checked = S.settings.safeMode;
   $("#setWatermark").checked = S.settings.hideWatermark;
@@ -1429,6 +1431,7 @@ $("#setTemp").oninput = e => { S.settings.temperature = +e.target.value; saveSet
 $("#tempReset").onclick = () => { S.settings.temperature = null; saveSettings(); syncTemp(); };
 $("#setVeniceSystem").onchange = e => { S.settings.veniceSystem = e.target.checked; saveSettings(); };
 $("#setReadLinks").onchange = e => { S.settings.readLinks = e.target.checked; saveSettings(); };
+$("#setBrowserTool").onchange = e => { S.settings.browserTool = e.target.checked; saveSettings(); };
 $("#setBudget").onchange = e => { const v = +e.target.value; S.settings.agentBudget = v > 0 ? v : 1; saveSettings(); };
 $("#setSafeMode").onchange = e => { S.settings.safeMode = e.target.checked; saveSettings(); };
 $("#setWatermark").onchange = e => { S.settings.hideWatermark = e.target.checked; saveSettings(); };
@@ -1438,7 +1441,7 @@ $("#setWatermark").onchange = e => { S.settings.hideWatermark = e.target.checked
 const nativeBrowser = window.webkit?.messageHandlers?.browser;
 const browserCmd = (cmd, args = {}) => nativeBrowser ? nativeBrowser.postMessage({ cmd, args }) : Promise.reject(new Error("браузер есть только в приложении для Mac"));
 S.approvals = new Map();
-const agentEnabled = () => !!nativeBrowser && S.settings.agent && S.settings.mode === "chat";
+const agentEnabled = () => !!nativeBrowser && S.settings.browserTool !== false && S.settings.mode === "chat";
 
 const BROWSER_TOOLS = [
   { name: "browser_open", description: "Открыть адрес в браузере. Можно передать и поисковый запрос — откроется поиск DuckDuckGo. Возвращает текст страницы и список элементов.", parameters: { type: "object", properties: { url: { type: "string", description: "Адрес (https://…) или поисковый запрос" } }, required: ["url"] } },
@@ -1558,7 +1561,9 @@ const archiveRules = list => `К разговору приложены архи�
 Картинки архива (логотипы, фоны, иконки) смотри инструментом archive_view_image — только те, что нужны для задачи.
 Экономь шаги: ищи через archive_search, затем открывай нужное место через archive_read с line. Нашёл ответ — сразу отвечай, без повторных перепроверок одного и того же.`;
 
-const AGENT_RULES = `Ты можешь работать во встроенном браузере пользователя через инструменты browser_*. Пользователь видит этот браузер в панели справа.
+const AGENT_RULES = `Тебе доступен встроенный браузер пользователя (инструменты browser_*).
+Когда пользоваться: только если для ответа нужно что-то посмотреть в интернете — прочитать страницу по ссылке, найти свежие данные, проверить факт — или пользователь просит что-то сделать на сайте. На обычные вопросы отвечай сразу, без браузера.
+Когда ты открываешь страницу, панель браузера сама появляется справа, и пользователь видит, что ты делаешь.
 Как работать:
 - Открой сайт (browser_open) — получишь текст страницы и пронумерованные элементы [N]. Нажимай (browser_click) и вводи текст (browser_type) по этим номерам.
 - После перехода или изменения страницы номера меняются — опирайся на самый свежий результат.
@@ -2059,25 +2064,12 @@ async function undoStep(chat, m, st) {
 const folderBtn = $("#folderBtn");
 folderBtn.onclick = () => pickFolder();
 
-// Кнопки: «Браузер» в поле ввода (режим агента) и в шапке (показать/скрыть панель)
-const agentBtn = $("#agentBtn"), browserBtn = $("#browserBtn");
+// Браузер — инструмент модели: отдельной кнопки нет, панель открывается сама (или Cmd+B)
 const syncAgent = () => {
-  agentBtn.hidden = !nativeBrowser || S.settings.mode !== "chat";
-  agentBtn.classList.toggle("on", !!S.settings.agent);
-  browserBtn.hidden = !nativeBrowser;
   folderBtn.hidden = S.settings.mode !== "chat";
   folderBtn.classList.toggle("on", !!currentFolder());
   folderBtn.title = currentFolder() ? `Папка проекта: ${currentFolder().path} — нажмите, чтобы выбрать другую` : "Открыть папку проекта: модель сама найдёт, прочитает и (с вашего разрешения) изменит файлы";
 };
-agentBtn.onclick = () => {
-  S.settings.agent = !S.settings.agent;
-  saveSettings();
-  syncAgent();
-  toast(S.settings.agent ? "Модель будет работать в браузере — он откроется справа" : "Работа в браузере выключена");
-  if (S.settings.agent) browserCmd("show").catch(() => {});
-};
-browserBtn.onclick = () => browserCmd("toggle").catch(() => {});
-window.onBrowserPanel = visible => browserBtn.classList.toggle("on", visible);
 
 // ================= Тема =================
 function applyTheme() {

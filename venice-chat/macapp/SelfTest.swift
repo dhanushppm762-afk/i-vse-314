@@ -3,8 +3,8 @@
 enum SelfTest {
     static let agentScript = #"""
 await new Promise(r => setTimeout(r, 2500));
-const before = S.settings.agent;
-S.settings.agent = !folder; setMode("chat"); newChat();
+const before = S.settings.browserTool;
+S.settings.browserTool = !folder; setMode("chat"); newChat();
 if (folder) S.pendingFolder = { path: folder, name: folder.split("/").pop() };
 $("#input").value = task; autoGrow();
 // в тесте на запросы разрешения отвечаем «запретить» (при VENICE_AGENTTEST_DENY); с папкой — «разрешить»
@@ -14,7 +14,7 @@ clearInterval(iv);
 const m = S.chat.messages.at(-1);
 const out = { steps: (m.steps || []).map(s => s.status + ": " + s.text), plan: m.plan || null, answer: (m.content || "").slice(0, 1500), error: m.error || null, usage: m.usage || null };
 await api.remove(S.chat.id);
-S.settings.agent = before; saveSettings();
+S.settings.browserTool = before; saveSettings();
 return JSON.stringify(out);
 """#
 
@@ -69,6 +69,7 @@ r.chunks = chunks;
 r.reply = text.split("\n").filter(l => l.startsWith("data:") && !l.includes("[DONE]"))
   .map(l => { try { return JSON.parse(l.slice(5)).choices[0].delta.content || ""; } catch { return ""; } }).join("");
 r.ui = !!document.querySelector("#composer") && !!document.querySelector("#chatList");
+r.browserTool = agentEnabled() && !document.querySelector("#agentBtn") && !document.querySelector("#browserBtn");
 const ac = new AbortController();
 const long = await fetch("/api/chat", { method: "POST", signal: ac.signal, headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ messages: [{ role: "user", content: "Write a 600-word story." }] }) });

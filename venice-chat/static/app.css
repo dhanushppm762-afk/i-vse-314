@@ -451,7 +451,6 @@ a.file-card:hover { border-color: var(--faint); }
 .pp-link .btn svg { width: 15px; height: 15px; }
 
 /* ---------- Браузер и шаги агента ---------- */
-#browserBtn.on { color: var(--accent); background: var(--accent-soft); }
 .steps { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--code-bg); font-size: 13.5px; }
 .step { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 3px 0; color: var(--muted); }
 .step-ico { display: grid; place-items: center; width: 16px; height: 16px; flex: none; }
