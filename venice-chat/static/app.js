@@ -2442,7 +2442,8 @@ const fmtNum = n => n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, "") + " мл
 const KIND_LABEL = { text: "Текст", image: "Картинки", edit: "Редактор", upscale: "Увеличение" };
 
 function logUsage(ev) {
-  fetch("/api/usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ts: Date.now(), ...ev }) }).catch(() => {});
+  fetch("/api/usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ts: Date.now(), ...ev }) })
+    .then(() => refreshUsageMini()).catch(() => {});
 }
 function textCost(modelId, inTok, outTok) {
   const p = findModel("text", modelId)?.pricing;
@@ -2627,6 +2628,45 @@ async function renderUsage() {
   const hideTip = () => { tip.hidden = true; chart.classList.remove("hovering"); };
   chart.addEventListener("mouseleave", hideTip);
 }
+
+// ---- мини-панель расходов над «Настройками»: сегодня, 14 дней столбиками, месяц и баланс ----
+let usageMiniTimer = 0;
+function refreshUsageMini() {
+  clearTimeout(usageMiniTimer);
+  usageMiniTimer = setTimeout(renderUsageMini, 800);
+}
+async function renderUsageMini() {
+  const el = $("#usageMini");
+  let data;
+  try { data = await api.json("/api/usage"); } catch { el.hidden = true; return; }
+  const all = (data.events || []).filter(e => e && e.ts);
+  const bal = data.balance;
+  const today = dayStart(Date.now());
+  const N = 14, from = today - (N - 1) * DAY;
+  const days = Array.from({ length: N }, (_, i) => ({ t: from + i * DAY, usd: 0, n: 0 }));
+  const month = new Date(today); month.setDate(1);
+  let monthUsd = 0;
+  for (const e of all) {
+    if (e.ts >= month.getTime()) monthUsd += e.usd || 0;
+    const d = days[Math.round((dayStart(e.ts) - from) / DAY)];
+    if (d) { d.usd += e.usd || 0; d.n++; }
+  }
+  const t = days[N - 1];
+  const max = Math.max(...days.map(d => d.usd), 1e-9);
+  const W = 200, H = 34, gap = 3, bw = (W - gap * (N - 1)) / N;
+  const bars = days.map((d, i) => {
+    const h = d.usd > 0 ? Math.max(3, (d.usd / max) * H) : 2;
+    const cls = i === N - 1 ? "today" : d.usd > 0 ? "" : "zero";
+    return `<rect class="${cls}" x="${(i * (bw + gap)).toFixed(2)}" y="${(H - h).toFixed(2)}" width="${bw.toFixed(2)}" height="${h.toFixed(2)}" rx="1.5"><title>${dayLabel(d.t)}: ${fmtUsd(d.usd)}${d.n ? ` · ${d.n} запр.` : ""}</title></rect>`;
+  }).join("");
+  el.innerHTML = `<div class="um-top"><span class="um-lbl">Сегодня</span><span class="um-val">${fmtUsd(t.usd)}${t.n ? `<small>${t.n} запр.</small>` : ""}</span></div>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="Расходы за 14 дней">${bars}</svg>
+    <div class="um-row"><span>Месяц <b>${fmtUsd(monthUsd)}</b></span><span>Баланс <b>${bal ? fmtUsd(bal.usd) : "—"}</b></span></div>`;
+  el.hidden = false;
+}
+$("#usageMini").onclick = () => { $("#settingsBtn").click(); showSettingsTab("usage"); };
+renderUsageMini();
+setInterval(renderUsageMini, 10 * 60 * 1000);   // смена дня и баланс
 
 function usageFoot() {
   return `<div class="u-foot"><span>Считается в этом приложении на этом компьютере. Текст — точная стоимость от Venice, картинки — по ценам моделей (≈).</span>` +
@@ -2999,10 +3039,30 @@ async function checkForUpdates(manual = false) {
 }
 window.checkForUpdates = checkForUpdates;
 
+let updateSound = null;
+async function playUpdateSound(times = 3) {
+  try {
+    const ctx = updateSound?.ctx || new AudioContext();
+    if (!updateSound) updateSound = { ctx, buf: await ctx.decodeAudioData(await (await fetch("update.wav")).arrayBuffer()) };
+    if (ctx.state === "suspended") await ctx.resume();
+    const { buf } = updateSound;
+    const t0 = ctx.currentTime + 0.05;
+    for (let i = 0; i < times; i++) {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start(t0 + i * buf.duration);
+    }
+  } catch {}
+}
+window.playUpdateSound = playUpdateSound;
+
 function showUpdateCard(info) {
   let card = $("#updateCard");
+  if (!card || card.dataset.ver !== info.latest) playUpdateSound();
   if (!card) { card = document.createElement("div"); card.id = "updateCard"; card.setAttribute("role", "status"); document.body.appendChild(card); }
   const notes = (info.notes || "").trim();
+  card.dataset.ver = info.latest;
   card.innerHTML = `<div class="u-head"><span class="u-dot"></span>Доступно обновление ${esc(info.latest)}</div>
     <div class="u-sub">У вас версия ${esc(info.current)}. Чаты и настройки сохранятся.</div>
     ${notes ? `<details><summary>Что нового</summary><div class="u-notes">${esc(notes)}</div></details>` : ""}

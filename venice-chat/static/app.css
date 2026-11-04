@@ -121,6 +121,21 @@ body.side-collapsed #sidebar { border-right: none; }
 .chat-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 6px; animation: pulse 1.2s infinite; }
 .empty-list { color: var(--faint); font-size: 13px; padding: 16px 10px; }
 .side-foot { border-top: 1px solid var(--line); padding: 8px; }
+/* Расходы над «Настройками» */
+#usageMini { display: block; width: 100%; margin-bottom: 6px; padding: 10px 12px 9px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); text-align: left; font: inherit; cursor: pointer; transition: border-color .15s, background .15s; }
+#usageMini[hidden] { display: none; }
+#usageMini:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+#usageMini .um-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+#usageMini .um-lbl { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--faint); }
+#usageMini .um-val { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+#usageMini .um-val small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+#usageMini svg { display: block; width: 100%; height: 34px; margin: 7px 0 6px; }
+#usageMini svg rect { fill: var(--accent); stroke: none; opacity: .38; transition: opacity .15s; }
+#usageMini svg rect:hover { opacity: .7; }
+#usageMini svg rect.today { opacity: 1; }
+#usageMini svg rect.zero { fill: var(--faint); opacity: .25; }
+#usageMini .um-row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+#usageMini .um-row b { color: var(--text); font-weight: 600; }
 .side-btn { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: none; border-radius: 8px; background: none; color: var(--muted); white-space: nowrap; }
 .side-btn:hover { background: var(--hover); color: var(--text); }
 

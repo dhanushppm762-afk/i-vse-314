@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let cfg = WKWebViewConfiguration()
         cfg.setURLSchemeHandler(Backend.shared, forURLScheme: "venice")
         cfg.websiteDataStore = .default()   // localStorage с настройками привязан к bundle id
+        cfg.mediaTypesRequiringUserActionForPlayback = []   // звук нового обновления играет без нажатия
         let ucc = cfg.userContentController
         ucc.add(self, name: "saveImage")
         ucc.add(self, name: "setTheme")
