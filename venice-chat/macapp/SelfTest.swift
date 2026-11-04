@@ -109,7 +109,19 @@ try {
   try { await slow; } catch {}
   r.fsRunStop = Date.now() - t0 < 5000;
   r.fsMemory = (await fs("memory", { add: "тест" })).notes.includes("тест");
-  r.fsUI = !!document.querySelector("#folderBtn") && typeof fsTool === "function" && FS_TOOLS.length === 13 && typeof undoAll === "function" && !document.querySelector("#agentBtn");
+  r.fsUI = !document.querySelector("#folderBtn") && !document.querySelector("#webBtn") && !!document.querySelector("#newProjectFolder") && typeof fsTool === "function" && FS_TOOLS.length === 13 && WEB_TOOLS.length === 1 && typeof webSearch === "function" && typeof undoAll === "function" && !document.querySelector("#agentBtn");
+  // правка по устаревшей копии не проходит; после правки видно, как место выглядит теперь
+  const rd = await fs("read", { path: "src/app.js" });
+  const ok1 = await fs("edit", { path: "src/app.js", old: "return 1;", new: "return 22;", expect: rd.version });
+  const stale = await fs("edit", { path: "src/app.js", old: "return 22;", new: "return 3;", expect: rd.version });
+  const fresh = await fs("edit", { path: "src/app.js", old: "return 22;", new: "return 1;", expect: ok1.version });
+  const exists = await fs("write", { path: "src/app.js", content: "x", mustBeNew: true });
+  r.fsStale = !!rd.version && (ok1.snippet || "").includes("return 22;") && /изменился/.test(stale.error || "") && !fresh.error && /уже есть/.test(exists.error || "");
+  r.fsSafeCmd = isSafeCommand("git status") && isSafeCommand("git diff --stat") && isSafeCommand("ls -la src") && !isSafeCommand("git push") && !isSafeCommand("ls; rm -rf x") && !isSafeCommand("git branch new-x") && !isSafeCommand("cat a > b");
+  // папка проекта: все чаты проекта работают с ней
+  S.projectCache.set("selftest-p", { id: "selftest-p", folder: { path: fsRoot, name: "t" } });
+  r.fsProjectFolder = folderOf({ projectId: "selftest-p" })?.path === fsRoot && folderOf({ projectId: "nope" }) === null;
+  S.projectCache.delete("selftest-p");
   // фоновая команда: сразу возвращается, потом видно завершение; долгую можно остановить
   const bg = await fs("run", { command: "echo bg-start; sleep 1; echo bg-end", background: true });
   const bgDone = await fs("job", { job: bg.job, wait: 10 });

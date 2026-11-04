@@ -458,7 +458,7 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
         guard let id else {
             guard method == "GET" else { return fail(t, 405, "Метод не поддерживается") }
             let fields = folder == "chats" ? ["id", "title", "created", "updated", "model", "projectId", "pinned"]
-                                           : ["id", "name", "description", "created", "updated"]
+                                           : ["id", "name", "description", "created", "updated", "folder"]
             DispatchQueue.global(qos: .userInitiated).async { [self] in
                 let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
                 var items: [[String: Any]] = []

@@ -49,7 +49,7 @@ final class Workspace {
     private func root(_ body: [String: Any]) throws -> URL {
         guard let r = body["root"] as? String, !r.isEmpty else { throw FsError("Папка проекта не выбрана") }
         let url = URL(fileURLWithPath: r).resolvingSymlinksInPath()
-        guard allowed.contains(url.path) else { throw FsError("Нет доступа к папке \(r): выберите её кнопкой «Папка»") }
+        guard allowed.contains(url.path) else { throw FsError("Нет доступа к папке \(r): подключите её к проекту заново") }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { throw FsError("Папки \(r) больше нет") }
         return url
@@ -111,7 +111,7 @@ final class Workspace {
     /// Страница закрыла запрос («Стоп») — останавливаем запущенную команду
     func cancel(_ id: ObjectIdentifier) {
         lock.lock(); let p = running[id]; lock.unlock()
-        if let p = p, p.isRunning { p.terminate() }
+        if let p = p, p.isRunning { stopTree(p) }
     }
 
     private func pick(_ t: WKURLSchemeTask) {
@@ -292,7 +292,33 @@ final class Workspace {
                 out.append(l); last = i + 1
             }
         }
-        return ["path": rel(r, url), "text": out.joined(separator: "\n"), "from": from, "to": last, "total": lines.count]
+        return ["path": rel(r, url), "text": out.joined(separator: "\n"), "from": from, "to": last, "total": lines.count, "version": version(url) ?? ""]
+    }
+
+    /// Отметка версии файла: время изменения (мкс) и размер. Другая — значит файл меняли
+    private func version(_ url: URL) -> String? {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: url.path), let d = a[.modificationDate] as? Date else { return nil }
+        return "\(Int64(d.timeIntervalSince1970 * 1_000_000))-\((a[.size] as? NSNumber)?.intValue ?? 0)"
+    }
+
+    /// Не даём править файл по устаревшей копии: expect — версия, которую модель видела при чтении
+    private func checkFresh(_ r: URL, _ url: URL, _ body: [String: Any]) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        if let exp = body["expect"] as? String, !exp.isEmpty, version(url) != exp {
+            throw FsError("Файл \(rel(r, url)) изменился после того, как ты его прочитал (его поменял пользователь, команда или форматировщик). Правка НЕ применена. Перечитай нужное место через read_file и повтори правку по свежему тексту.")
+        }
+        if body["mustBeNew"] as? Bool == true {
+            throw FsError("Файл \(rel(r, url)) уже есть, а ты его не читал. Прочитай его через read_file и правь через edit_file — иначе можно затереть чужие изменения.")
+        }
+    }
+
+    /// Как выглядит место правки теперь: несколько строк вокруг, с номерами
+    static func snippet(_ text: String, line: Int, new: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        let lo = max(1, line - 3)
+        let hi = min(lines.count, line + new.components(separatedBy: "\n").count - 1 + 3, lo + 39)
+        guard lo <= hi else { return "" }
+        return (lo...hi).map { "\($0)\t\(String(lines[$0 - 1].prefix(300)))" }.joined(separator: "\n")
     }
 
     /// Копия файла до правки — для кнопки «Отменить»
@@ -311,11 +337,12 @@ final class Workspace {
         let url = try resolve(r, body["path"])
         guard url.path != r.path else { throw FsError("Укажи путь к файлу") }
         let content = body["content"] as? String ?? ""
+        try checkFresh(r, url, body)
         let old = FileManager.default.fileExists(atPath: url.path) ? (try? readText(url)) : nil
         let id = try backup(r, url)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
-        return ["backup": id, "created": old == nil, "old": old ?? "", "path": rel(r, url)]
+        return ["backup": id, "created": old == nil, "old": old ?? "", "path": rel(r, url), "version": version(url) ?? ""]
     }
 
     private func edit(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
@@ -323,6 +350,7 @@ final class Workspace {
         guard FileManager.default.fileExists(atPath: url.path) else { throw FsError("Файла \(body["path"] as? String ?? "") нет — для нового файла используй write_file") }
         let oldText = body["old"] as? String ?? "", newText = body["new"] as? String ?? ""
         guard !oldText.isEmpty else { throw FsError("Пустой old — укажи точный кусок текста, который нужно заменить") }
+        try checkFresh(r, url, body)
         let text = try readText(url)
         let n = text.components(separatedBy: oldText).count - 1
         if n == 0 { throw FsError("Такого куска в файле нет. Перечитай файл через read_file и скопируй текст точно, с отступами") }
@@ -335,7 +363,8 @@ final class Workspace {
         else { let range = text.range(of: oldText)!; updated = text.replacingCharacters(in: range, with: newText) }
         let id = try backup(r, url)
         try updated.write(to: url, atomically: true, encoding: .utf8)
-        return ["backup": id, "replaced": all ? n : 1, "line": line, "path": rel(r, url)]
+        return ["backup": id, "replaced": all ? n : 1, "line": line, "path": rel(r, url), "version": version(url) ?? "",
+                "snippet": Self.snippet(updated, line: line, new: newText)]
     }
 
     private func undo(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
@@ -372,13 +401,20 @@ final class Workspace {
         try p.run()
         lock.lock(); running[id] = p; lock.unlock()
         var timedOut = false
-        let killer = DispatchWorkItem { if p.isRunning { timedOut = true; p.terminate() } }
+        let killer = DispatchWorkItem { [self] in if p.isRunning { timedOut = true; stopTree(p) } }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
         p.waitUntilExit()
         killer.cancel()
         pipe.fileHandleForReading.readabilityHandler = nil
-        let rest = pipe.fileHandleForReading.readDataToEndOfFile()
-        outLock.lock(); if output.count < cap { output.append(rest) }; let all = output; outLock.unlock()
+        // дочитываем вывод, но не дольше секунды: если команда оставила что-то работать (cmd &), оно держит канал открытым
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let rest = pipe.fileHandleForReading.readDataToEndOfFile()
+            outLock.lock(); if output.count < cap { output.append(rest) }; outLock.unlock()
+            drained.signal()
+        }
+        _ = drained.wait(timeout: .now() + 1)
+        outLock.lock(); let all = output; outLock.unlock()
         lock.lock(); running.removeValue(forKey: id); lock.unlock()
         var text = String(decoding: all, as: UTF8.self)
         if text.count > maxOutput {

@@ -514,5 +514,17 @@ a.file-card:hover { border-color: var(--faint); }
 .field select, .field input[type=number] { display: block; width: 100%; max-width: 360px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); padding: 8px 12px; outline: none; font: inherit; font-size: 14px; }
 .field input[type=number] { max-width: 140px; }
 .field select:focus, .field input[type=number]:focus { border-color: var(--faint); }
-.rollback { margin: 6px 0 10px; }
+.rollback { margin: 8px 0 2px; }
 .rollback .btn { font-size: 12.5px; padding: 5px 10px; }
+/* итог ответа: изменённые файлы */
+.changes { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin: 10px 0 4px; font-size: 13px; }
+.changes-head { font-weight: 600; margin-bottom: 4px; }
+.change summary { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; list-style: none; }
+.change summary::-webkit-details-marker { display: none; }
+.change-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.change-new { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 0 5px; }
+.change-n { font-variant-numeric: tabular-nums; font-size: 12px; white-space: nowrap; }
+.change-n .add { color: #2f9e57; } .change-n .del { color: #d0453b; }
+.change .diff { margin: 4px 0 8px; }
+.pp-folder { margin-bottom: 14px; }
+.pp-folder .pp-file .btn { font-size: 12.5px; padding: 4px 10px; white-space: nowrap; }
