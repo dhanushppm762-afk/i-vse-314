@@ -567,3 +567,6 @@ a.file-card:hover { border-color: var(--faint); }
 .code-more:hover { background: var(--hover); }
 @media (max-width: 640px) { .save-code span { display: none; } }
 #improve.busy { animation: pulse 1s ease-in-out infinite; pointer-events: none; }
+
+/* 3.9.2: снимки страниц в шагах браузера */
+.step-shot { display: block; max-width: min(360px, 100%); margin: 6px 0 4px; border: 1px solid var(--line); border-radius: 8px; cursor: zoom-in; }

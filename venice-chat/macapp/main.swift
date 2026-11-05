@@ -11,6 +11,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var chatView: WKWebView!
     let browser = BrowserPanel(frame: .zero)
     let split = NSSplitView()
+    var browserShown = false   // панель браузера видна справа (иначе браузер работает в фоне)
+    // Невидимое окно за пределами экрана: скрытый браузер живёт в нём — страницы грузятся и снимки работают,
+    // но панель не открывается и не мешает. Панель показывается только по ⌘B или если включено «Показывать браузер».
+    lazy var parking: NSWindow = {
+        let w = NSWindow(contentRect: NSRect(x: -30000, y: -30000, width: 1100, height: 900), styleMask: [.borderless], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.ignoresMouseEvents = true
+        w.isExcludedFromWindowsMenu = true
+        w.hasShadow = false
+        w.collectionBehavior = [.transient, .ignoresCycle, .stationary]
+        return w
+    }()
     let env = ProcessInfo.processInfo.environment
     var selfTest: Bool { env["VENICE_SELFTEST"] == "1" }
     private var testStarted = false
@@ -35,8 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         split.dividerStyle = .thin
         split.delegate = self
         split.addArrangedSubview(chatView)
-        split.addArrangedSubview(browser)
-        browser.isHidden = true
+        parkBrowser()
 
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 800),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -99,23 +110,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     @objc func reloadChat() { chatView.reload() }
-    @objc func toggleBrowser() { setBrowser(visible: browser.isHidden) }
+    @objc func toggleBrowser() { setBrowser(visible: !browserShown) }
     @objc func focusBrowserAddress() { setBrowser(visible: true); browser.focusAddress() }
     @objc func checkUpdates() { chatView.evaluateJavaScript("window.checkForUpdates && window.checkForUpdates(true)") }
 
+    func parkBrowser() {
+        if browser.superview === split { split.removeArrangedSubview(browser) }
+        browser.removeFromSuperview()
+        let host = parking.contentView!
+        browser.frame = host.bounds
+        browser.autoresizingMask = [.width, .height]
+        host.addSubview(browser)
+        parking.setFrameOrigin(NSPoint(x: -30000, y: -30000))
+        parking.orderBack(nil)
+    }
+
     func setBrowser(visible: Bool) {
-        guard browser.isHidden == visible else { return }
-        browser.isHidden = !visible
+        guard browserShown != visible else { return }
+        browserShown = visible
         if visible {
-            if browser.superview !== split { split.addArrangedSubview(browser) }
+            browser.removeFromSuperview()
+            browser.autoresizingMask = []
+            split.addArrangedSubview(browser)
             split.adjustSubviews()
             let w = split.bounds.width
             split.setPosition(max(420, w * 0.5), ofDividerAt: 0)
         } else {
-            // Скрытая панель внутри NSSplitView оставляла разделитель и пустую полосу посередине.
-            // Убираем панель из окна совсем (сама страница браузера при этом сохраняется) — чат на всю ширину.
-            split.removeArrangedSubview(browser)
-            browser.removeFromSuperview()
+            // панель уходит в невидимое окно: чат на всю ширину, без полосы посередине, а браузер продолжает работать
+            parkBrowser()
             split.adjustSubviews()
             chatView.frame = split.bounds
         }
@@ -126,9 +148,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     func splitView(_ s: NSSplitView, constrainMaxCoordinate p: CGFloat, ofSubviewAt i: Int) -> CGFloat { s.bounds.width - 320 }
     // браузер скрыт — чат занимает всё окно и при изменении размера
     func splitView(_ s: NSSplitView, resizeSubviewsWithOldSize old: NSSize) {
-        if browser.isHidden { chatView.frame = s.bounds } else { s.adjustSubviews() }
+        if !browserShown { chatView.frame = s.bounds } else { s.adjustSubviews() }
     }
-    func splitView(_ s: NSSplitView, shouldHideDividerAt i: Int) -> Bool { browser.isHidden }
+    func splitView(_ s: NSSplitView, shouldHideDividerAt i: Int) -> Bool { !browserShown }
 
     // MARK: мосты JS → Swift
 
@@ -154,9 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         switch cmd {
         case "show": setBrowser(visible: true); replyHandler(["ok": true], nil)
         case "hide": setBrowser(visible: false); replyHandler(["ok": true], nil)
-        case "toggle": toggleBrowser(); replyHandler(["visible": !browser.isHidden], nil)
+        case "toggle": toggleBrowser(); replyHandler(["visible": browserShown], nil)
         default:
-            if ["open", "click", "type", "back", "screenshot"].contains(cmd) { setBrowser(visible: true) }   // снимок нужен видимой панели
+            // панель открывается сама, только если в настройках включено «Показывать браузер» (show: true)
+            if (args["show"] as? Bool) == true && ["open", "click", "type", "back"].contains(cmd) { setBrowser(visible: true) }
             browser.run(cmd, args) { replyHandler($0, nil) }
         }
     }
