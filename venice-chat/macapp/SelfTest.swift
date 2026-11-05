@@ -1,6 +1,14 @@
 // Самотесты: VENICE_SELFTEST=1 ./VeniceChat — печатает JSON со всеми проверками и выходит.
 // VENICE_AGENTTEST="задание" — прогоняет модель в браузере на реальной задаче (тестовый чат удаляется).
+// VENICE_EVAL=1 (или compare, или список id через запятую) — проверка качества ответов, см. static/eval.js.
 enum SelfTest {
+    static let evalScript = #"""
+await new Promise(r => setTimeout(r, 2500));
+await new Promise((ok, fail) => { const s = document.createElement("script"); s.src = "eval.js"; s.onload = ok; s.onerror = () => fail(new Error("eval.js не загрузился")); document.head.appendChild(s); });
+const only = mode && mode !== "1" && mode !== "compare" ? mode.split(",") : null;
+return JSON.stringify(await window.runEval({ compare: mode === "compare", only }), null, 1);
+"""#
+
     static let agentScript = #"""
 await new Promise(r => setTimeout(r, 2500));
 const before = S.settings.browserTool;
@@ -13,7 +21,7 @@ await send();
 clearInterval(iv);
 const m = S.chat.messages.at(-1);
 const out = { steps: (m.steps || []).map(s => s.status + ": " + s.text), plan: m.plan || null, answer: (m.content || "").slice(0, 1500), error: m.error || null, usage: m.usage || null };
-await api.remove(S.chat.id);
+S.chat.deleted = true; await new Promise(r => setTimeout(r, 800)); await api.remove(S.chat.id); S.chats = S.chats.filter(c => c.id !== S.chat.id);
 S.settings.browserTool = before; saveSettings();
 return JSON.stringify(out);
 """#

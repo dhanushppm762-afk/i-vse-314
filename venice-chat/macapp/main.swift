@@ -235,7 +235,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         guard selfTest, !testStarted else { return }
         testStarted = true
         print("SELFTEST page loaded")
-        if let task = env["VENICE_AGENTTEST"], !task.isEmpty { runAgentTest(task) } else { runSelfTest() }
+        if let mode = env["VENICE_EVAL"], !mode.isEmpty {
+            chatView.callAsyncJavaScript(SelfTest.evalScript, arguments: ["mode": mode], in: nil, in: .page) { [weak self] in self?.finish($0) }
+        } else if let task = env["VENICE_AGENTTEST"], !task.isEmpty { runAgentTest(task) } else { runSelfTest() }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
