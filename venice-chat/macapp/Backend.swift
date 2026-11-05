@@ -25,6 +25,7 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 600
         cfg.timeoutIntervalForResource = 3600
+        cfg.httpMaximumConnectionsPerHost = 16   // несколько чатов и подзадач одновременно не ждут в очереди
         return URLSession(configuration: cfg, delegate: self, delegateQueue: .main)
     }()
     private lazy var fetchSession: URLSession = {
