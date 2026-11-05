@@ -106,16 +106,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     func setBrowser(visible: Bool) {
         guard browser.isHidden == visible else { return }
         browser.isHidden = !visible
-        split.adjustSubviews()
         if visible {
+            split.adjustSubviews()
             let w = split.bounds.width
             split.setPosition(max(420, w * 0.5), ofDividerAt: 0)
+        } else {
+            chatView.frame = split.bounds   // чат снова на всю ширину, без чёрной полосы на месте браузера
         }
         chatView.evaluateJavaScript("window.onBrowserPanel && window.onBrowserPanel(\(visible))")
     }
 
     func splitView(_ s: NSSplitView, constrainMinCoordinate p: CGFloat, ofSubviewAt i: Int) -> CGFloat { 380 }
     func splitView(_ s: NSSplitView, constrainMaxCoordinate p: CGFloat, ofSubviewAt i: Int) -> CGFloat { s.bounds.width - 320 }
+    // браузер скрыт — чат занимает всё окно и при изменении размера
+    func splitView(_ s: NSSplitView, resizeSubviewsWithOldSize old: NSSize) {
+        if browser.isHidden { chatView.frame = s.bounds } else { s.adjustSubviews() }
+    }
+    func splitView(_ s: NSSplitView, shouldHideDividerAt i: Int) -> Bool { browser.isHidden }
 
     // MARK: мосты JS → Swift
 

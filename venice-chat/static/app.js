@@ -3183,11 +3183,10 @@ async function playUpdateSound(times = 3) {
   } catch {}
 }
 window.playUpdateSound = playUpdateSound;
-// звук при запуске приложения (перезагрузка страницы внутри того же запуска — без звука)
-try { if (!sessionStorage.getItem("launchSound")) { sessionStorage.setItem("launchSound", "1"); playUpdateSound(); } } catch { playUpdateSound(); }
 
 function showUpdateCard(info) {
   let card = $("#updateCard");
+  if (!card || card.dataset.ver !== info.latest) playUpdateSound();   // звук только когда вышла новая версия
   if (!card) { card = document.createElement("div"); card.id = "updateCard"; card.setAttribute("role", "status"); document.body.appendChild(card); }
   const notes = (info.notes || "").trim();
   card.dataset.ver = info.latest;
