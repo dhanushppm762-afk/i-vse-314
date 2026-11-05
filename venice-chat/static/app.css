@@ -570,3 +570,8 @@ a.file-card:hover { border-color: var(--faint); }
 
 /* 3.9.2: снимки страниц в шагах браузера */
 .step-shot { display: block; max-width: min(360px, 100%); margin: 6px 0 4px; border: 1px solid var(--line); border-radius: 8px; cursor: zoom-in; }
+
+/* 3.10: оценки ответов */
+.icon-btn.rate.on { color: var(--accent); }
+.fb-form { display: flex; gap: 8px; margin: 6px 0 4px; max-width: 560px; }
+.fb-form input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }

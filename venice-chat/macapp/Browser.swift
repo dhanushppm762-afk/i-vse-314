@@ -17,6 +17,8 @@ final class BrowserPanel: NSView, WKNavigationDelegate, WKUIDelegate, NSTextFiel
     override init(frame: NSRect) {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()   // входы на сайты сохраняются между запусками
+        // ошибки JS и незагрузившиеся файлы страницы — чтобы ИИ видел, что сайт сломан, даже без снимка
+        cfg.userContentController.addUserScript(WKUserScript(source: Self.errorsJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         webView = WKWebView(frame: .zero, configuration: cfg)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
         webView.allowsBackForwardNavigationGestures = true
@@ -168,6 +170,17 @@ final class BrowserPanel: NSView, WKNavigationDelegate, WKUIDelegate, NSTextFiel
     const byRef = ref => document.querySelector(`[data-agent-ref="${ref}"]`);
     """
 
+    private static let errorsJS = """
+    window.__vcErrors = [];
+    const __vcPush = s => { if (window.__vcErrors.length < 30) window.__vcErrors.push(String(s).slice(0, 300)); };
+    addEventListener("error", e => {
+      const t = e.target;
+      if (t && t !== window && (t.src || t.href)) __vcPush("Не загрузилось: " + (t.src || t.href));
+      else __vcPush("JS: " + e.message + (e.filename ? " (" + e.filename.split("/").pop() + ":" + e.lineno + ")" : ""));
+    }, true);
+    addEventListener("unhandledrejection", e => __vcPush("JS (promise): " + ((e.reason && e.reason.message) || e.reason)));
+    """
+
     private static let readJS = helpers + """
     const MAX_TEXT = 15000;
     document.querySelectorAll("[data-agent-ref]").forEach(e => e.removeAttribute("data-agent-ref"));
@@ -209,6 +222,7 @@ final class BrowserPanel: NSView, WKNavigationDelegate, WKUIDelegate, NSTextFiel
       scroll: `${Math.round(scrollY)} из ${Math.max(0, document.documentElement.scrollHeight - innerHeight)} px`,
       text: text.slice(from, from + MAX_TEXT), textFrom: from, textTotal: text.length,
       elements: lines.join("\\n"), elementCount: els.length,
+      errors: (window.__vcErrors || []).slice(-10),
     };
     """
 
