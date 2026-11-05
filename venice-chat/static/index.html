@@ -73,6 +73,7 @@
           <button id="attach" class="icon-btn" title="Прикрепить файлы (можно перетащить или вставить)">
             <svg viewBox="0 0 24 24"><path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg>
           </button>
+          <button id="improve" class="icon-btn" type="button" title="Улучшить запрос: ИИ перепишет его понятнее"></button>
           <div class="modes" id="modes">
             <button type="button" data-mode="chat" title="Обычный чат с моделью">
               <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-11.8 7L4 20l1-4.2A8 8 0 1 1 20 12z"/></svg><span>Чат</span>
@@ -88,6 +89,11 @@
           <select id="aspect" class="mini" title="Соотношение сторон" hidden></select>
           <select id="resolution" class="mini" title="Разрешение" hidden></select>
           <span id="ctxMeter" class="ctx-meter" hidden></span>
+          <select id="think" class="mini" title="Сколько модели думать перед ответом" hidden>
+            <option value="auto">Думать: авто</option>
+            <option value="fast">Думать: быстро</option>
+            <option value="deep">Думать: глубоко</option>
+          </select>
           <select id="model" title="Модель"></select>
           <button id="send" class="send" title="Отправить"></button>
         </div>
@@ -125,6 +131,18 @@
     <label class="field">
       <span>Системный промпт <small>— инструкция модели для всех чатов</small></span>
       <textarea id="setSystem" rows="6" placeholder="Например: отвечай кратко и по-русски"></textarea>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="setUserMemoryOn">
+      <span>Запоминать меня между чатами <small>— ИИ сам сохраняет то, что вы о себе рассказали и как любите получать ответы</small></span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="setProjectDigests">
+      <span>Чаты проекта знают друг о друге <small>— новый чат в проекте видит краткое содержание прошлых</small></span>
+    </label>
+    <label class="field">
+      <span>Что ИИ помнит о вас <small>— можно поправить или стереть</small></span>
+      <textarea id="setUserMemory" rows="4" placeholder="Пока ничего. Например: живу в Нью-Йорке; люблю короткие ответы"></textarea>
     </label>
     <label class="field">
       <span>Температура: <b id="tempValue">по умолчанию</b> <small>— выше = креативнее</small></span>

@@ -559,3 +559,11 @@ a.file-card:hover { border-color: var(--faint); }
 .ctx-meter.high { color: var(--accent); }
 .ctx-divider { display: flex; align-items: center; gap: 10px; margin: 8px 0 18px; color: var(--muted); font-size: 12.5px; text-align: center; }
 .ctx-divider::before, .ctx-divider::after { content: ""; flex: 1; border-top: 1px dashed currentColor; opacity: .45; }
+
+/* 3.9: код — кнопки, сворачивание длинного */
+.code-btns { display: inline-flex; gap: 2px; }
+.codeblock.long:not(.open) pre { max-height: calc(13.5px * 1.6 * 30 + 28px); overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 80%, transparent); mask-image: linear-gradient(to bottom, #000 80%, transparent); }
+.code-more { display: block; width: 100%; border: none; border-top: 1px solid var(--line); background: none; color: var(--accent); font: 13px -apple-system, sans-serif; padding: 8px; cursor: pointer; }
+.code-more:hover { background: var(--hover); }
+@media (max-width: 640px) { .save-code span { display: none; } }
+#improve.busy { animation: pulse 1s ease-in-out infinite; pointer-events: none; }

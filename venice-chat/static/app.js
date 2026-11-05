@@ -121,14 +121,22 @@ function persist(chat) {
 
 // ================= Markdown =================
 const renderer = new marked.Renderer();
+const CODE_FOLD = 30;   // длинный код сворачивается до стольких строк (только когда ответ уже готов)
+let renderingLive = false;
+const LANG_EXT = { js: "js", javascript: "js", jsx: "jsx", ts: "ts", typescript: "ts", tsx: "tsx", html: "html", xml: "xml", css: "css", scss: "scss",
+  json: "json", python: "py", py: "py", bash: "sh", sh: "sh", shell: "sh", zsh: "sh", swift: "swift", java: "java", kotlin: "kt", go: "go", rust: "rs",
+  ruby: "rb", php: "php", sql: "sql", yaml: "yml", yml: "yml", markdown: "md", md: "md", c: "c", cpp: "cpp", "c++": "cpp", csharp: "cs", cs: "cs", toml: "toml", ini: "ini" };
 renderer.code = (code, info) => {
   const lang = (info || "").trim().split(/\s+/)[0].toLowerCase();
   let html;
   try { html = lang && hljs.getLanguage(lang) ? hljs.highlight(code, { language: lang, ignoreIllegals: true }).value : esc(code); }
   catch { html = esc(code); }
-  return `<div class="codeblock"><div class="code-head"><span>${esc(lang || "код")}</span>` +
-    `<button class="copy-code" type="button">${ICON.copy}<span>Копировать</span></button></div>` +
-    `<pre><code class="hljs">${html}</code></pre></div>`;
+  const lines = code.replace(/\n$/, "").split("\n").length;
+  const long = !renderingLive && lines > CODE_FOLD + 8;
+  return `<div class="codeblock${long ? " long" : ""}" data-ext="${LANG_EXT[lang] || "txt"}"><div class="code-head"><span>${esc(lang || "код")}${lines > 1 ? ` · ${lines} строк` : ""}</span><span class="code-btns">` +
+    `<button class="save-code" type="button" title="Сохранить в файл">${ICON.download}<span>Скачать</span></button>` +
+    `<button class="copy-code" type="button">${ICON.copy}<span>Копировать</span></button></span></div>` +
+    `<pre><code class="hljs">${html}</code></pre>${long ? `<button class="code-more" type="button">Показать весь код · ${lines} строк</button>` : ""}</div>`;
 };
 marked.setOptions({ gfm: true, breaks: false });
 DOMPurify.addHook("afterSanitizeAttributes", node => {
@@ -158,6 +166,34 @@ function renderMarkdown(src) {
   text = text.replace(/\u0001(\d+)\u0001/g, (_, i) => codes[i]);
   const html = DOMPurify.sanitize(marked.parse(text, { renderer }), { ADD_ATTR: ["target"] });
   return html.replace(/MATHX(\d+)X/g, (_, i) => maths[i]);
+}
+
+// Пока ответ печатается, заново переводим в HTML только хвост: готовые абзацы берём из кэша.
+// Граница — последняя пустая строка вне блока кода и вне формулы $$.
+const MD_CACHE = new WeakMap();
+function stableCut(text) {
+  let cut = 0, fence = false, math = false;
+  const re = /\n\n|^(```|~~~)|\$\$/gm;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m[0] === "\n\n") { if (!fence && !math) cut = m.index + 2; }
+    else if (m[0] === "$$") { if (!fence) math = !math; }
+    else fence = !fence;
+  }
+  return cut;
+}
+function renderMd(m, content, live) {
+  renderingLive = live;
+  try {
+    if (!live) return renderMarkdown(content);
+    const cut = stableCut(content);
+    let c = MD_CACHE.get(m);
+    if (!c || !content.startsWith(c.src) || c.src.length !== cut) {
+      c = { src: content.slice(0, cut), html: cut ? renderMarkdown(content.slice(0, cut)) : "" };
+      MD_CACHE.set(m, c);
+    }
+    return c.html + renderMarkdown(content.slice(cut));
+  } finally { renderingLive = false; }
 }
 
 // Некоторые модели присылают размышления прямо в тексте, внутри <think>…</think>
@@ -368,7 +404,7 @@ function messageNode(m, i) {
     html += `<details class="think"${S.openThink.has(m) ? " open" : ""}><summary>${ICON.chevron}${label}</summary><div class="think-body">${esc(reasoning)}</div></details>`;
   }
   html += stepsHtml;
-  if (content) html += `<div class="md">${renderMarkdown(content)}</div>`;
+  if (content) html += `<div class="md">${renderMd(m, content, live)}</div>`;
   else if (live && !reasoning) html += `<div class="typing"><i></i><i></i><i></i></div>`;
   if (m.error) html += `<div class="error-box">${ICON.alert}<div>${esc(m.error)}</div></div>`;
   if (!live && m.steps?.length) html += changesHtml(m);
@@ -420,17 +456,35 @@ function updateMessage(chat, m) {
     if (os.innerHTML !== ns.innerHTML) os.innerHTML = ns.innerHTML;
     const ob = $(".think-body", oldD), nb2 = $(".think-body", newD);
     if (ob.textContent !== nb2.textContent) ob.textContent = nb2.textContent;
-    const kids = [...fresh.childNodes], k = kids.indexOf(newD);
-    for (const c of [...old.childNodes]) if (c !== oldD) c.remove();
-    oldD.before(...kids.slice(0, k));
-    oldD.after(...kids.slice(k + 1));
-    for (const a of [...old.attributes]) if (!fresh.hasAttribute(a.name)) old.removeAttribute(a.name);
-    for (const a of [...fresh.attributes]) if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
+    newD.replaceWith(oldD.cloneNode(false));   // место блока; сам блок переставлять нельзя
+    morphKids(old, fresh, oldD);
     node = old;
-  } else old.replaceWith(fresh);
+  } else if (old.className === fresh.className) { morphKids(old, fresh); node = old; }
+  else old.replaceWith(fresh);
   const nb = $(".think-body", node);
   if (nb && S.stream?.msg === m && atEnd) nb.scrollTop = nb.scrollHeight;
   if (S.stick) scrollToBottom();
+}
+
+// Меняем только то, что изменилось: готовые абзацы, картинки и формулы не пересоздаются —
+// текст не мерцает, а выделение и раскрытые блоки не сбрасываются
+function morphKids(old, fresh, keep) {
+  const a = [...old.childNodes], b = [...fresh.childNodes];
+  let i = 0;
+  for (; i < b.length; i++) {
+    const o = a[i], n = b[i];
+    if (keep && o === keep && n.nodeType === 1 && n.matches?.(".think")) continue;
+    if (!o) { old.appendChild(n); continue; }
+    if (o.nodeType === 1 && n.nodeType === 1 && o.tagName === n.tagName && o.className === n.className && o.classList.contains("md")) { morphKids(o, n); continue; }
+    if (o.nodeType === n.nodeType && (o.nodeType === 1 ? o.outerHTML === n.outerHTML : o.nodeValue === n.nodeValue)) continue;
+    if (o === keep) { old.insertBefore(n, o); a.splice(i, 0, n); continue; }
+    o.replaceWith(n); a[i] = n;
+  }
+  for (const o of a.slice(i)) if (o !== keep) o.remove();
+  if (old.attributes && fresh.attributes) {
+    for (const at of [...old.attributes]) if (!fresh.hasAttribute(at.name)) old.removeAttribute(at.name);
+    for (const at of [...fresh.attributes]) if (old.getAttribute(at.name) !== at.value) old.setAttribute(at.name, at.value);
+  }
 }
 
 let frame = 0;
@@ -453,6 +507,13 @@ $("#scroll").addEventListener("scroll", () => {
 $("#thread").addEventListener("click", e => {
   const copyCode = e.target.closest(".copy-code");
   if (copyCode) return copyText($("code", copyCode.closest(".codeblock")).innerText, copyCode);
+  const saveCode = e.target.closest(".save-code");
+  if (saveCode) {
+    const cb = saveCode.closest(".codeblock");
+    return saveFile($("code", cb).innerText, `код-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.${cb.dataset.ext || "txt"}`);
+  }
+  const more = e.target.closest(".code-more");
+  if (more) { const cb = more.closest(".codeblock"); more.dataset.label ||= more.textContent; cb.classList.toggle("open"); more.textContent = cb.classList.contains("open") ? "Свернуть код" : more.dataset.label; return; }
   const sug = e.target.closest(".suggestions button");
   if (sug) { $("#input").value = sug.textContent; autoGrow(); $("#input").focus(); return; }
   const btn = e.target.closest("[data-act]");
@@ -501,6 +562,16 @@ $("#thread").addEventListener("click", e => {
 function imageExt(dataUrl) {
   const t = /^data:image\/(\w+)/.exec(dataUrl || "")?.[1] || "png";
   return t === "jpeg" ? "jpg" : t;
+}
+
+// Сохранить текст в файл: в приложении — окно «Сохранить как», в браузере — обычная загрузка
+function saveFile(text, name) {
+  const dataUrl = "data:text/plain;base64," + btoa(unescape(encodeURIComponent(text)));
+  const native = window.webkit?.messageHandlers?.saveImage;
+  if (native) return native.postMessage({ dataUrl, name });
+  const a = document.createElement("a");
+  a.href = dataUrl; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
 }
 
 function saveImage(dataUrl) {
@@ -576,7 +647,50 @@ function updateSendBtn() {
   btn.innerHTML = busy ? ICON.stop : ICON.send;
   btn.title = busy ? "Остановить (Esc)" : "Отправить";
   btn.disabled = !!S.linksBusy || (!busy && !$("#input").value.trim() && !S.pending.length);
+  if (typeof updateImproveBtn === "function") updateImproveBtn();
 }
+
+// «Улучшить запрос»: модель переписывает текст в поле ввода понятнее и конкретнее; повторное нажатие возвращает исходный
+async function improvePrompt() {
+  const input = $("#input"), btn = $("#improve");
+  if (S.improveUndo != null && input.value === S.improveDone) {
+    input.value = S.improveUndo; S.improveUndo = null; autoGrow(); updateImproveBtn(); return;
+  }
+  const text = input.value.trim();
+  if (!text) return toast("Напишите запрос — я сделаю его понятнее для ИИ");
+  if (btn.classList.contains("busy")) return;
+  btn.classList.add("busy");
+  const model = S.chat?.model || S.settings.model || S.defaultModel;
+  const recent = (S.chat?.messages || []).slice(-4).filter(m => m.role === "user" || splitThink(m).content)
+    .map(m => `${m.role === "user" ? "Пользователь" : "Ассистент"}: ${shortText(m.role === "user" ? m.content : splitThink(m).content, 600)}`).join("\n");
+  try {
+    const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      model, stream: false, max_tokens: 1200,
+      messages: [{ role: "user", content: `Перепиши запрос пользователя к ИИ-помощнику так, чтобы ИИ понял его с первого раза: конкретно, по шагам, если задача сложная, с ожидаемым результатом и форматом ответа. Сохрани язык, смысл, тон и все детали пользователя; ничего не выдумывай и не добавляй своих требований. Не отвечай на сам запрос. Верни только новый текст запроса, без кавычек и пояснений.${recent ? `\n\nНачало переписки (для понимания, что имеется в виду):\n${recent}` : ""}\n\nЗапрос:\n${text}` }],
+      venice_parameters: { include_venice_system_prompt: false, disable_thinking: true, strip_thinking_response: true },
+    }) });
+    if (!res.ok) throw new Error(readError(await res.text()));
+    const j = await res.json();
+    if (j.usage) logUsage({ kind: "text", model, inTok: j.usage.prompt_tokens || 0, outTok: j.usage.completion_tokens || 0,
+      usd: j.cost?.usd ?? textCost(model, j.usage.prompt_tokens || 0, j.usage.completion_tokens || 0), note: "improve" });
+    const better = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content.trim().replace(/^["«]|["»]$/g, "");
+    if (!better) throw new Error("пустой ответ");
+    S.improveUndo = input.value; S.improveDone = better;
+    input.value = better; autoGrow(); updateSendBtn();
+    toast("Запрос улучшен. Нажмите ↶, чтобы вернуть свой текст");
+  } catch (e) { toast("Не получилось улучшить запрос: " + e.message); }
+  finally { btn.classList.remove("busy"); updateImproveBtn(); }
+}
+function updateImproveBtn() {
+  const btn = $("#improve");
+  const undo = S.improveUndo != null && $("#input").value === S.improveDone;
+  btn.innerHTML = undo ? ICON.retry : ICON.wand;
+  btn.title = undo ? "Вернуть мой исходный текст" : "Улучшить запрос: ИИ перепишет его понятнее";
+  btn.hidden = S.settings.mode !== "chat";
+}
+$("#improve").onclick = improvePrompt;
+updateImproveBtn();
+$("#input").addEventListener("input", updateImproveBtn);
 
 async function send() {
   if (S.stream) { S.stream.controller.abort(); return; }
@@ -889,6 +1003,7 @@ async function runImage(chat) {
     updateSendBtn();
     if (S.chat === chat) { renderThread(); if (S.stick) scrollToBottom(); }
     persist(chat);
+    if (!msg.error) updateDigest(chat);
   }
 }
 
@@ -925,6 +1040,12 @@ function requestBody(chat, messages, extra = {}) {
     ...rest,
   };
   if (S.settings.temperature !== null) body.temperature = S.settings.temperature;
+  // «Думать»: быстро — без размышлений, глубоко — дольше думать (для моделей, которые размышляют)
+  if (findModel("text", chat.model)?.reasoning && !rest.noThink) {
+    if (S.settings.think === "fast") body.venice_parameters.disable_thinking = true;
+    if (S.settings.think === "deep" && !S.noEffort) body.reasoning_effort = "high";
+  }
+  delete body.noThink;
   return body;
 }
 
@@ -998,6 +1119,34 @@ async function runCompletion(chat) {
   }
 }
 
+// Краткое содержание чата проекта — его видят другие чаты того же проекта. Обновляется в фоне,
+// когда в чате прибавилось сообщений, и стоит копейки (короткий запрос без размышлений).
+async function updateDigest(chat) {
+  if (S.settings.projectDigests === false || !chat?.projectId || chat.messages.length < 4 || chat.messages.length - (chat.digestAt || 0) < 4) return;
+  chat.digestAt = chat.messages.length;
+  const clip = (t, n) => t.length > n ? t.slice(0, n) + "…" : t;
+  const lines = chat.messages.slice(-12).filter(m => m.role === "user" || splitThink(m).content).map(m =>
+    `${m.role === "user" ? "Пользователь" : "Ассистент"}: ${clip((m.role === "user" ? m.content : splitThink(m).content) || "", 1500)}`);
+  try {
+    const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      model: chat.model, stream: false, max_tokens: 300,
+      messages: [{ role: "user", content: `Опиши этот чат в 2–3 предложениях для другого ассистента: о чём он, что решили или сделали, что осталось. Только суть, на языке переписки, без вступлений.\n\n${chat.summary ? `Сводка начала: ${clip(chat.summary.text, 2000)}\n\n` : ""}${lines.join("\n\n")}` }],
+      venice_parameters: { include_venice_system_prompt: false, disable_thinking: true, strip_thinking_response: true },
+    }) });
+    if (!res.ok) return;
+    const j = await res.json();
+    if (j.usage) logUsage({ kind: "text", model: chat.model, inTok: j.usage.prompt_tokens || 0, outTok: j.usage.completion_tokens || 0,
+      usd: j.cost?.usd ?? textCost(chat.model, j.usage.prompt_tokens || 0, j.usage.completion_tokens || 0), note: "digest" });
+    const text = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content.trim().replace(/\s+/g, " ").slice(0, 600);
+    if (!text) return;
+    const p = await api.getProject(chat.projectId);
+    p.digests = { ...(p.digests || {}), [chat.id]: { title: chat.title || "Чат", text, updated: Date.now() } };
+    await api.saveProject(p);
+    S.projectCache.set(p.id, p);
+    if (S.project?.id === p.id) S.project.digests = p.digests;
+  } catch {}
+}
+
 async function autoTitle(chat) {
   const first = chat.messages.find(m => m.role === "user");
   const seed = (first?.content || first?.files?.map(f => f.name).join(", ") || "").slice(0, 800);
@@ -1069,7 +1218,11 @@ function setModelSelect(id) {
 // Пропорции и разрешение — только для картинок и только те, что поддерживает выбранная модель
 function renderImageOptions() {
   const mode = S.settings.mode;
+  updateImproveBtn();
   const aspectSel = $("#aspect"), resSel = $("#resolution");
+  const think = $("#think");
+  think.hidden = mode !== "chat" || !findModel("text", $("#model").value)?.reasoning;
+  think.value = S.settings.think || "auto";
   if (mode === "chat") { aspectSel.hidden = resSel.hidden = true; return; }
   const c = findModel(MODES[mode].type, $("#model").value)?.constraints || {};
   let aspects = c.aspectRatios || DEFAULT_ASPECTS;
@@ -1104,6 +1257,7 @@ $("#model").addEventListener("change", () => {
   if (mode === "chat" && S.project && !S.chat) renderProjectPage();
   renderImageOptions();
 });
+$("#think").addEventListener("change", () => { S.settings.think = $("#think").value; saveSettings(); });
 $("#aspect").addEventListener("change", () => { S.settings.aspect[S.settings.mode] = $("#aspect").value; saveSettings(); });
 $("#resolution").addEventListener("change", () => { S.settings.resolution[S.settings.mode] = $("#resolution").value; saveSettings(); });
 
@@ -1452,6 +1606,9 @@ function syncTemp() {
 }
 $("#settingsBtn").onclick = () => {
   $("#setSystem").value = S.settings.system;
+  $("#setUserMemory").value = S.settings.userMemory || "";
+  $("#setUserMemoryOn").checked = S.settings.userMemoryOn !== false;
+  $("#setProjectDigests").checked = S.settings.projectDigests !== false;
   $("#setVeniceSystem").checked = S.settings.veniceSystem;
   $("#setBaseRules").checked = S.settings.baseRules !== false;
   $("#setReviewAgent").checked = S.settings.reviewAgent !== false;
@@ -1511,6 +1668,9 @@ $("#saveKey").onclick = () => {
 $("#setKey").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("#saveKey").click(); } });
 $("#resetKey").onclick = () => submitKey("");
 $("#setSystem").oninput = e => { S.settings.system = e.target.value; saveSettings(); };
+$("#setUserMemory").oninput = e => { S.settings.userMemory = e.target.value; saveSettings(); };
+$("#setUserMemoryOn").onchange = e => { S.settings.userMemoryOn = e.target.checked; saveSettings(); };
+$("#setProjectDigests").onchange = e => { S.settings.projectDigests = e.target.checked; saveSettings(); };
 $("#setTemp").oninput = e => { S.settings.temperature = +e.target.value; saveSettings(); syncTemp(); };
 $("#tempReset").onclick = () => { S.settings.temperature = null; saveSettings(); syncTemp(); };
 $("#setVeniceSystem").onchange = e => { S.settings.veniceSystem = e.target.checked; saveSettings(); };
@@ -1742,6 +1902,10 @@ async function runTool(call, chat, msg) {
   scheduleUpdate(chat, msg);
   const done = (status, text, result) => { step.status = status; if (text) step.text = text; scheduleUpdate(chat, msg); return result; };
   const failed = r => r?.error || r?.loadError;
+  if (call.name === "remember_user") {
+    const ok = rememberUser(args.note);
+    return done("ok", ok ? `Запомнил о вас: ${shortText(args.note, 80)}` : "Это я уже помню", { text: ok ? "Сохранено. Это будет учитываться в следующих чатах." : "Это уже было сохранено." });
+  }
   if (call.name === "web_search") {
     step.text = `Ищу в интернете: «${shortText(args.query, 60)}»`;
     scheduleUpdate(chat, msg);
@@ -1897,8 +2061,15 @@ async function streamRequest(body, controller) {
   const arm = ms => { clearTimeout(timer); timer = setTimeout(() => { silent = true; own.abort(); }, ms); };
   arm(SILENT_FIRST);
   try {
-    const res = await fetch("/api/chat", { method: "POST", signal: own.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    if (!res.ok) throw new Error(readError(await res.text()));
+    let res = await fetch("/api/chat", { method: "POST", signal: own.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!res.ok) {
+      const err = readError(await res.text());
+      // модель не понимает «думать глубже» — один раз повторяем без этого и больше не шлём
+      if (!(body.reasoning_effort && /reasoning_effort/i.test(err))) throw new Error(err);
+      S.noEffort = true; delete body.reasoning_effort;
+      res = await fetch("/api/chat", { method: "POST", signal: own.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(readError(await res.text()));
+    }
     const reader = res.body.getReader();
     let got = false;
     return {
@@ -1990,7 +2161,7 @@ async function runAgent(chat) {
   const useBrowser = agentEnabled();
   const archives = archivesFor(chat);
   const folder = folderOf(chat);
-  const tools = [...(folder ? FS_TOOLS : []), ...WEB_TOOLS, ...(useBrowser ? BROWSER_TOOLS : []), ...(archives.length ? ARCHIVE_TOOLS : [])];
+  const tools = [...(folder ? FS_TOOLS : []), ...WEB_TOOLS, ...(S.settings.userMemoryOn !== false ? MEMORY_TOOLS : []), ...(useBrowser ? BROWSER_TOOLS : []), ...(archives.length ? ARCHIVE_TOOLS : [])];
   // «Стоп» во время ожидания разрешения — считаем это отказом, чтобы цикл не завис
   controller.signal.addEventListener("abort", () => { for (const st of msg.steps) S.approvals.get(st)?.(false); });
   const total = { in: 0, out: 0, usd: 0, any: false };
@@ -2134,6 +2305,7 @@ async function runAgent(chat) {
     updateSendBtn();
     if (S.chat === chat) { renderThread(); if (S.stick) scrollToBottom(); }
     persist(chat);
+    if (!msg.error) updateDigest(chat);
   }
 }
 
@@ -2622,7 +2794,7 @@ async function runHelper(chat, msg, step, task, { label, maxSteps, system, title
 async function workSummary(chat, convo, controller, why) {
   const ask = { role: "user", content: `${why} Напиши сводку проделанной работы для себя же, чтобы продолжить без потерь:
 1) исходная задача пользователя и его уточнения; 2) что уже сделано (какие файлы созданы и изменены, какие скрипты написаны и где лежат); 3) важные находки: пути, имена, как устроен код, команды проверки; 4) что осталось сделать — конкретный следующий шаг. Не повторяй то, что уже проверено. Только сводка, без вступлений.` };
-  const body = requestBody(chat, [...convo.map(apiMsg), ask], { stream: false });
+  const body = requestBody(chat, [...convo.map(apiMsg), ask], { stream: false, noThink: true });
   delete body.stream_options;
   const res = await fetch("/api/chat", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(readError(await res.text()));
@@ -3315,7 +3487,26 @@ function baseRules(chat) {
 - Ошибку сначала объясни (причина в одной-двух фразах), потом исправь.
 - Пользователь не программист: шаги «что нажать и куда вставить» — простыми словами.
 
-Сложная задача (расчёт, логика, код, план): сначала продумай решение и проверь себя — расчёты, крайние случаи, совпадает ли с просьбой. В ответе — итог и короткое объяснение, без черновика рассуждений.`;
+Сложная задача (расчёт, логика, код, план): сначала продумай решение и проверь себя — расчёты, крайние случаи, совпадает ли с просьбой. В ответе — итог и короткое объяснение, без черновика рассуждений.${userMemoryText()}`;
+}
+const userMemoryText = () => {
+  if (S.settings.userMemoryOn === false) return "";
+  const t = (S.settings.userMemory || "").trim();
+  return t ? `\n\nЧто ты знаешь о пользователе из прошлых разговоров (учитывай, но не пересказывай без нужды):\n${t}` : "";
+};
+// Память о пользователе между чатами: модель сама сохраняет устойчивые факты и предпочтения
+const USER_MEMORY_MAX = 2500;
+const MEMORY_TOOLS = [{ type: "function", function: { name: "remember_user", description: "Запомнить о пользователе устойчивый факт или предпочтение на будущие чаты: как ему удобнее получать ответы, чем он занимается, где живёт, над чем постоянно работает, что ему не нравится. Вызывай, только когда пользователь сам это сообщил или явно показал, и только для того, что пригодится в других разговорах (не детали текущей задачи, не пароли и не личные данные третьих лиц). Пиши коротко, одной строкой.", parameters: { type: "object", properties: { note: { type: "string" } }, required: ["note"] } } }];
+function rememberUser(note) {
+  note = String(note || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  if (!note) return false;
+  const lines = (S.settings.userMemory || "").split("\n").map(l => l.trim()).filter(Boolean);
+  if (lines.some(l => l.replace(/^- /, "").toLowerCase() === note.toLowerCase())) return false;
+  lines.push("- " + note);
+  while (lines.join("\n").length > USER_MEMORY_MAX) lines.shift();
+  S.settings.userMemory = lines.join("\n");
+  saveSettings();
+  return true;
 }
 
 // ================= Память чата: длинная переписка сжимается в сводку =================
@@ -3372,7 +3563,7 @@ async function summarizeChat(chat, prev, msgs, controller) {
 ${prev ? `\nПрошлая сводка (включи её содержание в новую):\n${prev}\n` : ""}
 Переписка:
 ${lines.join("\n\n")}`;
-  const body = requestBody(chat, [{ role: "user", content: ask }], { stream: false, max_tokens: 3000 });
+  const body = requestBody(chat, [{ role: "user", content: ask }], { stream: false, max_tokens: 3000, noThink: true });
   delete body.stream_options;
   body.venice_parameters = { ...body.venice_parameters, include_venice_system_prompt: false, disable_thinking: true, strip_thinking_response: true };
   const res = await fetch("/api/chat", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -3407,6 +3598,10 @@ async function systemPrompt(chat) {
   if (p) {
     parts.push(`Этот чат — часть проекта «${p.name}».${p.description ? " " + p.description : ""}`);
     if (p.instructions?.trim()) parts.push(`Инструкции проекта:\n${p.instructions.trim()}`);
+    const alive = new Set(S.chats.map(c => c.id));
+    const others = S.settings.projectDigests === false ? [] : Object.entries(p.digests || {}).filter(([id]) => id !== chat.id && alive.has(id)).sort((a, b) => b[1].updated - a[1].updated).slice(0, 8);
+    if (others.length) parts.push(`Другие чаты этого проекта — кратко, чтобы ты знал контекст (подробностей из них не выдумывай; если нужны — спроси):\n` +
+      others.map(([, d]) => `- «${d.title}» (${new Date(d.updated).toLocaleDateString("ru-RU")}): ${d.text}`).join("\n"));
     if (p.files?.length) {
       parts.push("Файлы проекта (справочные материалы, учитывай их в ответах):\n\n" +
         p.files.map(f => /\.zip$/i.test(f.name) ? f.data : `<file name="${f.name}">\n${f.data}\n</file>`).join("\n\n"));
