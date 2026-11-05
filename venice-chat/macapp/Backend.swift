@@ -293,7 +293,7 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
                 bal = v
                 withUsage { u in u["balance"] = v }
             }
-            DispatchQueue.main.async { [self] in json(t, 200, ["balance": bal ?? NSNull()]) }
+            DispatchQueue.main.async { [self] in json(t, 200, ["balance": (bal as Any?) ?? NSNull()]) }
         }.resume()
     }
 
