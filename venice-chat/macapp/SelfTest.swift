@@ -40,6 +40,8 @@ if (b) {
   const opened = await b.postMessage({ cmd: "open", args: { url: "https://example.com" } });
   const snap = await b.postMessage({ cmd: "read" });
   r.browserOpen = opened.title + " | elements=" + snap.elementCount + " | " + (snap.elements || "").split("\n")[0];
+  const shot = await b.postMessage({ cmd: "screenshot" });   // браузер скрыт — снимок всё равно должен получиться
+  r.browserHiddenShot = shot.image ? "ok, " + Math.round(shot.image.length / 1024) + " КБ" : "FAIL " + shot.error;
   await b.postMessage({ cmd: "hide" });
 }
 const badKey = await fetch("/api/key", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: "not-a-real-key" }) });
