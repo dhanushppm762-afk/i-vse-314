@@ -107,11 +107,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         guard browser.isHidden == visible else { return }
         browser.isHidden = !visible
         if visible {
+            if browser.superview !== split { split.addArrangedSubview(browser) }
             split.adjustSubviews()
             let w = split.bounds.width
             split.setPosition(max(420, w * 0.5), ofDividerAt: 0)
         } else {
-            chatView.frame = split.bounds   // чат снова на всю ширину, без чёрной полосы на месте браузера
+            // Скрытая панель внутри NSSplitView оставляла разделитель и пустую полосу посередине.
+            // Убираем панель из окна совсем (сама страница браузера при этом сохраняется) — чат на всю ширину.
+            split.removeArrangedSubview(browser)
+            browser.removeFromSuperview()
+            split.adjustSubviews()
+            chatView.frame = split.bounds
         }
         chatView.evaluateJavaScript("window.onBrowserPanel && window.onBrowserPanel(\(visible))")
     }
@@ -150,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         case "hide": setBrowser(visible: false); replyHandler(["ok": true], nil)
         case "toggle": toggleBrowser(); replyHandler(["visible": !browser.isHidden], nil)
         default:
-            if ["open", "click", "type", "back"].contains(cmd) { setBrowser(visible: true) }
+            if ["open", "click", "type", "back", "screenshot"].contains(cmd) { setBrowser(visible: true) }   // снимок нужен видимой панели
             browser.run(cmd, args) { replyHandler($0, nil) }
         }
     }
