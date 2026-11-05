@@ -319,6 +319,13 @@ function filesHtml(files) {
   files = (files || []).filter(f => !fromArchive(f));
   if (!files.length) return "";
   return `<div class="files">${files.map(f => {
+    // видео: одна карточка с полоской кадров вместо десятка больших картинок
+    if (f.video) {
+      const frames = files.filter(x => x.frame && x.name.startsWith(f.name + " — "));
+      return `<div class="video-card"><div class="vhead">${ICON.file}<span class="name">${esc(f.name)}</span><span class="sub">${esc(f.video)}</span></div>` +
+        `<div class="vstrip">${frames.map(x => `<img src="${x.data}" alt="${esc(x.name)}" title="${esc(x.name)}">`).join("")}</div></div>`;
+    }
+    if (f.frame) return "";
     if (f.kind === "image" && f.data) return `<img src="${f.data}" alt="${esc(f.name)}" title="${esc(f.name)}">`;
     if (f.link) {
       const sub = `${f.link.includes("github.com") ? "GitHub" : linkHost(f.link)} · ≈${fmtNum(Math.round((f.data?.length || 0) / 4))} ток.`;
@@ -564,7 +571,10 @@ async function send() {
     S.chat.title = (text || S.pending[0]?.name || "Новый чат").replace(/\s+/g, " ").slice(0, 60);
     renderTitle();
   }
-  const files = S.pending.map(({ name, kind, data, link, note, archive }) => ({ name, kind, data, ...(link ? { link, note } : {}), ...(archive ? { archive, note } : {}) }));
+  const files = S.pending.flatMap(({ name, kind, data, link, note, archive, frames }) => kind === "video"
+    ? [{ name, kind: "text", data, video: note }, ...frames]
+    : [{ name, kind, data, ...(link ? { link, note } : {}), ...(archive ? { archive, note } : {}) }]);
+  if (S.pending.some(p => p.kind === "video") && !findModel("text", S.chat.model)?.vision) toast("Эта модель не видит картинки — для видео выберите модель с 👁");
   S.chat.messages.push(files.length ? { role: "user", content: text, files } : { role: "user", content: text });
   S.pending = [];
   renderPending();
@@ -1100,6 +1110,39 @@ const ARCHIVE_STORE_MAX = 15_000_000;  // сколько текста архив
 const ARCHIVE_FILE_MAX = 1_500_000;    // один файл больше этого обрезается
 const ZIP_INLINE_MAX = 300_000;        // файл крупнее не вставляем в сообщение — модель прочитает его по частям
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const VIDEO_EXT = /\.(mov|mp4|m4v|webm)$/i;
+// Видео модели не принимают — отправляем кадры как картинки (запись экрана для отладки и т.п.)
+const VIDEO_FRAMES = 10, VIDEO_SIDE = 1280;
+const fmtTime = t => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+async function readVideo(file) {
+  const url = URL.createObjectURL(file);
+  const v = document.createElement("video");
+  v.muted = true; v.preload = "auto"; v.playsInline = true; v.src = url;
+  const once = (ev, ms = 15000) => new Promise((ok, bad) => {
+    const t = setTimeout(() => bad(new Error("видео не открылось — поддерживаются MOV и MP4")), ms);
+    v.addEventListener(ev, () => { clearTimeout(t); ok(); }, { once: true });
+    v.addEventListener("error", () => { clearTimeout(t); bad(new Error("видео не открылось — поддерживаются MOV и MP4")); }, { once: true });
+  });
+  try {
+    await once("loadeddata");
+    const dur = isFinite(v.duration) ? v.duration : 0;
+    // равномерно по ролику, не чаще раза в полсекунды; первый кадр чуть позже начала, последний — чуть раньше конца
+    const n = Math.max(1, Math.min(VIDEO_FRAMES, Math.floor(dur / 0.5) || 1));
+    const times = Array.from({ length: n }, (_, i) => n === 1 ? Math.min(0.1, dur / 2) : Math.min(dur - 0.05, 0.1 + (dur - 0.2) * i / (n - 1)));
+    const s = Math.min(1, VIDEO_SIDE / Math.max(v.videoWidth, v.videoHeight));
+    const c = document.createElement("canvas");
+    c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
+    const g = c.getContext("2d");
+    const frames = [];
+    for (const t of times) {
+      if (Math.abs(v.currentTime - t) > 0.01) { const p = once("seeked"); v.currentTime = t; await p; }
+      g.drawImage(v, 0, 0, c.width, c.height);
+      frames.push({ name: `${file.name} — ${fmtTime(t)}`, kind: "image", data: c.toDataURL("image/jpeg", 0.82), fitted: true, frame: true });
+    }
+    const note = `Видео «${file.name}», длительность ${fmtTime(dur)}, ${v.videoWidth}×${v.videoHeight}. Модели не видят видео целиком, поэтому ниже ${plural(frames.length, "кадр", "кадра", "кадров")} по порядку, моменты: ${times.map(fmtTime).join(", ")}. Звука нет.`;
+    return { kind: "video", data: note, frames, note: `${fmtTime(dur)}, ${plural(frames.length, "кадр", "кадра", "кадров")}` };
+  } finally { URL.revokeObjectURL(url); v.removeAttribute("src"); v.load(); }
+}
 // Зависимости — всегда мимо. Папки сборки (dist, build…) — только если рядом есть исходники:
 // у готового сайта весь код как раз лежит в build/dist.
 const ZIP_DEPS = /(^|\/)(__MACOSX|\.git|\.svn|\.hg|node_modules|bower_components|jspm_packages|vendor|\.venv|venv|__pycache__|\.pytest_cache|\.mypy_cache|\.parcel-cache|\.turbo|\.cache|\.idea|\.vscode|\.gradle|Pods|DerivedData)(\/|$)/i;
@@ -1155,6 +1198,7 @@ async function docxText(file) {
 async function readFile(file) {
   const name = file.name.toLowerCase();
   if (file.type.startsWith("image/") || IMAGE_EXT.test(name)) return { kind: "image", data: await readAs(file, "readAsDataURL") };
+  if (file.type.startsWith("video/") || VIDEO_EXT.test(name)) return readVideo(file);
   if (name.endsWith(".pdf")) return { kind: "text", data: await pdfText(file) };
   if (name.endsWith(".docx")) return { kind: "text", data: await docxText(file) };
   const text = decodeText(await readAs(file, "readAsArrayBuffer"));
@@ -1285,8 +1329,8 @@ function renderPending() {
   const own = !!(S.chat?.folder || (!S.chat && !S.project && S.pendingFolder));
   $("#attachBar").innerHTML = (folder ? `<div class="chip folder-chip"><div class="ico">${ICON.folder}</div><span class="name" title="${esc(folder.path)}${own ? "" : " — папка проекта"}">${esc(folder.name)}</span>` +
     (own ? `<button type="button" class="x" data-folder="1" title="Отключить папку">${ICON.x}</button>` : "") + `</div>` : "") + S.pending.map(p => {
-    const thumb = p.kind === "image" && p.data ? `<img src="${p.data}" alt="">` : `<div class="ico">${p.link ? ICON.link : /\.zip$/i.test(p.name) ? ICON.zip : ICON.file}</div>`;
-    return `<div class="chip${p.loading ? " loading" : ""}">${thumb}<span class="name" title="${esc(p.name)}">${esc(p.name)}${p.loading ? " …" : ""}</span>` +
+    const thumb = p.kind === "image" && p.data ? `<img src="${p.data}" alt="">` : p.kind === "video" ? `<img src="${p.frames[0].data}" alt="">` : `<div class="ico">${p.link ? ICON.link : /\.zip$/i.test(p.name) ? ICON.zip : ICON.file}</div>`;
+    return `<div class="chip${p.loading ? " loading" : ""}">${thumb}<span class="name" title="${esc(p.name)}">${esc(p.name)}${p.kind === "video" ? ` · ${esc(p.note)}` : ""}${p.loading ? " …" : ""}</span>` +
       `<button type="button" class="x" data-id="${p.id}" title="Убрать">${ICON.x}</button></div>`;
   }).join("");
   // В «Редакторе» без вложений подсказываем, какое фото будет изменено

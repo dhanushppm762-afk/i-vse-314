@@ -163,6 +163,13 @@ body.side-collapsed #expandBtn, body.side-collapsed #newChatTop { display: inlin
 .bubble { background: var(--user); padding: 10px 16px; border-radius: 18px; max-width: 85%; white-space: pre-wrap; word-wrap: break-word; line-height: 1.55; font-size: 15.5px; }
 .files { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-bottom: 8px; max-width: 85%; }
 .files img { max-width: 240px; max-height: 180px; border-radius: 12px; border: 1px solid var(--line); display: block; }
+.video-card { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); padding: 8px 10px 10px; max-width: 100%; }
+.video-card .vhead { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 8px; min-width: 0; }
+.video-card .vhead svg { width: 16px; height: 16px; flex: none; color: var(--muted); }
+.video-card .vhead .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.video-card .vhead .sub { color: var(--muted); white-space: nowrap; }
+.video-card .vstrip { display: flex; gap: 4px; overflow-x: auto; }
+.video-card .vstrip img { height: 64px; width: auto; max-width: none; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; }
 .file-card { display: flex; align-items: center; gap: 10px; padding: 8px 12px 8px 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); max-width: 260px; }
 .file-card .ico { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); flex: none; }
 .file-card .meta { min-width: 0; }
