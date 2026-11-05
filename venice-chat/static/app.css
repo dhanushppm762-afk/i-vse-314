@@ -393,6 +393,7 @@ select.mini:hover { background: var(--hover); color: var(--text); }
   #thread { padding: 8px 16px 32px; }
   .composer-wrap { padding: 0 12px 10px; }
   #model { max-width: 130px; }
+  #ctxMeter { display: none; }
   .toggle span, .modes button span { display: none; }
 }
 
@@ -552,3 +553,9 @@ a.file-card:hover { border-color: var(--faint); }
 .pp-folder .pp-file .btn { font-size: 12.5px; padding: 4px 10px; white-space: nowrap; }
 .chat-item .wait { display: inline-flex; color: #d98a1f; margin-right: 6px; }
 .chat-item .wait svg { width: 14px; height: 14px; }
+
+/* 3.7: память чата */
+.ctx-meter { color: var(--muted); font-size: 12px; padding: 4px 6px; border-radius: 8px; white-space: nowrap; cursor: default; font-variant-numeric: tabular-nums; }
+.ctx-meter.high { color: var(--accent); }
+.ctx-divider { display: flex; align-items: center; gap: 10px; margin: 8px 0 18px; color: var(--muted); font-size: 12.5px; text-align: center; }
+.ctx-divider::before, .ctx-divider::after { content: ""; flex: 1; border-top: 1px dashed currentColor; opacity: .45; }

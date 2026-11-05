@@ -79,12 +79,14 @@ const S = {
   stick: true,        // автопрокрутка вниз
   defaultModel: null,
   settings: Object.assign({
-    system: "", temperature: null, veniceSystem: true, web: false,
+    system: "", temperature: null, veniceSystem: false, baseRules: true, web: false,
     mode: "chat", model: null, imageModel: null, editModel: null,
     aspect: {}, resolution: {}, safeMode: true, hideWatermark: true,
   }, local.get("settings", {})),
 };
 const saveSettings = () => local.set("settings", S.settings);
+// 3.7: встроенная инструкция Venice по умолчанию выключена — у приложения свои правила оформления, они не должны спорить
+if (!S.settings.v37) { S.settings.veniceSystem = false; S.settings.baseRules = true; S.settings.v37 = true; saveSettings(); }
 
 // ================= API =================
 const api = {
@@ -302,6 +304,7 @@ const WELCOME = {
 
 function renderThread() {
   const thread = $("#thread");
+  renderCtxMeter();
   if (!S.chat && S.project) return renderProjectPage();
   if (!S.chat || !S.chat.messages.length) {
     const mode = S.settings.mode;
@@ -310,7 +313,10 @@ function renderThread() {
     return;
   }
   thread.innerHTML = "";
-  S.chat.messages.forEach((m, i) => thread.appendChild(messageNode(m, i)));
+  S.chat.messages.forEach((m, i) => {
+    if (S.chat.summary?.upTo === i) thread.insertAdjacentHTML("beforeend", `<div class="ctx-divider" title="Сообщения выше модель помнит по сводке">Начало чата выше сжато в сводку — модель помнит его кратко</div>`);
+    thread.appendChild(messageNode(m, i));
+  });
 }
 
 const fromArchive = f => f.kind === "image" && /\.zip\//i.test(f.name || "");
@@ -942,8 +948,10 @@ async function runCompletion(chat) {
 
   try {
     await prepareImages(chat);
-    const messages = blindSafe(chat, chat.messages.slice(0, -1).filter(m => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content).map(toApi));
-    const system = await systemPrompt(chat);
+    let system = await systemPrompt(chat);
+    const { history: messages, note } = await chatHistory(chat, system, 0.6, controller, () => { msg.content = "_Чат длинный — сжимаю начало переписки в сводку…_"; scheduleUpdate(chat, msg); });
+    msg.content = "";
+    system = [system, note].filter(Boolean).join("\n\n");
     if (system) messages.unshift({ role: "system", content: system });
 
     // модели без инструментов: поиск Venice сам, когда нужен
@@ -963,7 +971,7 @@ async function runCompletion(chat) {
         let json;
         try { json = JSON.parse(data); } catch { continue; }
         if (json.error) throw new Error(readError(JSON.stringify(json)));
-        if (json.usage) msg.usage = { in: json.usage.prompt_tokens || 0, out: json.usage.completion_tokens || 0, usd: json.cost?.usd ?? null };
+        if (json.usage) { msg.usage = { in: json.usage.prompt_tokens || 0, out: json.usage.completion_tokens || 0, usd: json.cost?.usd ?? null }; chat.ctxIn = msg.usage.in; }
         const delta = json.choices?.[0]?.delta || {};
         const r = delta.reasoning_content || delta.reasoning || "";
         if (r) { msg.reasoning += r; if (!thinkStart) thinkStart = Date.now(); }
@@ -1445,6 +1453,7 @@ function syncTemp() {
 $("#settingsBtn").onclick = () => {
   $("#setSystem").value = S.settings.system;
   $("#setVeniceSystem").checked = S.settings.veniceSystem;
+  $("#setBaseRules").checked = S.settings.baseRules !== false;
   $("#setReadLinks").checked = S.settings.readLinks !== false;
   $("#setBrowserToolRow").hidden = !nativeBrowser;
   $("#setBrowserTool").checked = S.settings.browserTool !== false;
@@ -1504,6 +1513,7 @@ $("#setSystem").oninput = e => { S.settings.system = e.target.value; saveSetting
 $("#setTemp").oninput = e => { S.settings.temperature = +e.target.value; saveSettings(); syncTemp(); };
 $("#tempReset").onclick = () => { S.settings.temperature = null; saveSettings(); syncTemp(); };
 $("#setVeniceSystem").onchange = e => { S.settings.veniceSystem = e.target.checked; saveSettings(); };
+$("#setBaseRules").onchange = e => { S.settings.baseRules = e.target.checked; saveSettings(); };
 $("#setReadLinks").onchange = e => { S.settings.readLinks = e.target.checked; saveSettings(); };
 $("#setBrowserTool").onchange = e => { S.settings.browserTool = e.target.checked; saveSettings(); };
 $("#setExploreModel").onchange = e => { S.settings.exploreModel = e.target.value || null; saveSettings(); };
@@ -1909,10 +1919,20 @@ async function streamRequest(body, controller) {
 
 // Один запрос к модели с инструментами; текст показывается по мере поступления.
 // Если Venice молчит до первого ответа — повторяем один раз, потом сообщаем.
+// Мысли модели на шаге с инструментами передаём в следующий шаг той же задачи — так она помнит, зачем делает
+// очередное действие, и реже ходит по кругу (DeepSeek и другие «думающие» модели этого ждут).
+// Если Venice или модель такое поле не принимает — один раз выключаем и больше не шлём.
+const THOUGHT_MAX = 4000;
+const thoughtOf = turn => !S.noThoughtEcho && turn.reasoning?.trim()
+  ? { reasoning_content: turn.reasoning.length > THOUGHT_MAX ? "…" + turn.reasoning.slice(-THOUGHT_MAX) : turn.reasoning } : {};
+const stripThoughts = convo => { for (const m of convo) delete m.reasoning_content; };
 async function agentTurn(chat, msg, convo, controller, tools) {
   for (let attempt = 1; ; attempt++) {
     try { return await agentTurnOnce(chat, msg, convo, controller, tools); }
     catch (e) {
+      if (!S.noThoughtEcho && !e.partial && /reasoning/i.test(e.message || "") && convo.some(m => m.reasoning_content)) {
+        S.noThoughtEcho = true; stripThoughts(convo); attempt--; continue;
+      }
       if (!(e instanceof SilentError) || e.partial || attempt >= 2) throw e;
       if (msg?.steps) { msg.steps.push({ status: "note", text: "Venice не отвечает — повторяю запрос" }); scheduleUpdate(chat, msg); }
     }
@@ -1922,7 +1942,7 @@ async function agentTurnOnce(chat, msg, convo, controller, tools) {
   const stream = await streamRequest(requestBody(chat, convo.map(apiMsg), tools.length ? { tools, tool_choice: "auto" } : {}), controller);
   const decoder = new TextDecoder();
   const calls = [];
-  let buf = "", content = "", usage = null;
+  let buf = "", content = "", usage = null, reasoning = "";
   try {
   for (;;) {
     let r;
@@ -1941,7 +1961,8 @@ async function agentTurnOnce(chat, msg, convo, controller, tools) {
       if (json.error) throw new Error(readError(JSON.stringify(json)));
       if (json.usage) usage = { in: json.usage.prompt_tokens || 0, out: json.usage.completion_tokens || 0, usd: json.cost?.usd ?? null };
       const delta = json.choices?.[0]?.delta || {};
-      if (msg && (delta.reasoning_content || delta.reasoning)) msg.reasoning += delta.reasoning_content || delta.reasoning;
+      const think = delta.reasoning_content || delta.reasoning || "";
+      if (think) { reasoning += think; if (msg) msg.reasoning += think; }
       if (delta.content) { content += delta.content; if (msg) msg.content = content; }
       for (const tc of delta.tool_calls || []) {
         const c = calls[tc.index ?? 0] ||= { id: "", name: "", args: "" };
@@ -1953,7 +1974,7 @@ async function agentTurnOnce(chat, msg, convo, controller, tools) {
     if (msg) scheduleUpdate(chat, msg);
   }
   } finally { stream.done(); }
-  return { content, calls: calls.filter(c => c.name).map((c, i) => ({ ...c, id: c.id || `call_${Date.now()}_${i}` })), usage };
+  return { content, reasoning, calls: calls.filter(c => c.name).map((c, i) => ({ ...c, id: c.id || `call_${Date.now()}_${i}` })), usage };
 }
 
 async function runAgent(chat) {
@@ -1973,7 +1994,6 @@ async function runAgent(chat) {
   const total = { in: 0, out: 0, usd: 0, any: false };
   try {
     await prepareImages(chat);
-    const history = blindSafe(chat, chat.messages.slice(0, -1).filter(m => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content).map(toApi));
     const page = useBrowser ? await browserCmd("status").catch(() => ({})) : {};
     let info = null;
     if (folder) {
@@ -1990,7 +2010,11 @@ async function runAgent(chat) {
       archives.length ? archiveRules(archives) : "",
       useBrowser ? AGENT_RULES : "",
       useBrowser ? (page.url ? `Сейчас в браузере открыто: ${page.url} — «${page.title || ""}».` : "Браузер пока пуст.") : ""].filter(Boolean).join("\n\n");
-    const convo = [{ role: "system", content: system }, ...history];
+    // переписка до задачи занимает не больше трети памяти (с папкой) — остальное нужно для работы
+    const compactStep = { status: "run", text: "Чат длинный — сжимаю начало переписки в сводку" };
+    const { history, note } = await chatHistory(chat, system, folder ? 0.35 : 0.6, controller, () => { msg.steps.push(compactStep); scheduleUpdate(chat, msg); });
+    if (compactStep.status === "run" && msg.steps.includes(compactStep)) { compactStep.status = "ok"; compactStep.text = "Сжал начало переписки в сводку"; }
+    const convo = [{ role: "system", content: [system, note].filter(Boolean).join("\n\n") }, ...history];
     const MAX_STEPS = folder ? 250 : archives.length ? 60 : 30;
     const budget = folder ? (+S.settings.agentBudget > 0 ? +S.settings.agentBudget : 1) : Infinity;   // $ на одну задачу
     const keep = convo.length;   // системный промпт и переписка до задачи — не сжимаются
@@ -2006,6 +2030,7 @@ async function runAgent(chat) {
     for (let step = 0; step < MAX_STEPS; step++) {
       const turn = await agentTurn(chat, msg, convo, controller, tools);
       add(turn.usage);
+      if (turn.usage?.in) chat.ctxIn = turn.usage.in;
       if (!turn.calls.length) break;
       if (total.usd >= budget) {
         msg.content = (turn.content || "").trim() + `\n\n_Остановился: на эту задачу потрачено $${total.usd.toFixed(2)} (лимит $${budget} — меняется в настройках). Напишите «продолжай», чтобы продолжить._`;
@@ -2015,7 +2040,7 @@ async function runAgent(chat) {
       // промежуточные пояснения модели («сейчас открою…») — в список шагов, в ответе останется только итог
       if (turn.content.trim()) msg.steps.push({ status: "note", text: shortText(turn.content.trim(), 160) });
       msg.content = "";
-      convo.push({ role: "assistant", content: turn.content || "", tool_calls: turn.calls.map(c => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })) });
+      convo.push({ role: "assistant", content: turn.content || "", ...thoughtOf(turn), tool_calls: turn.calls.map(c => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })) });
       // чтения и поиски — одновременно; всё, что меняет файлы или браузер, — по очереди
       const parallel = turn.calls.length > 1 && turn.calls.every(c => PARALLEL_TOOLS.has(c.name) || (c.name === "run_command" && safeCall(c)));
       const ready = parallel ? await Promise.all(turn.calls.map(c => runTool(c, chat, msg))) : [];
@@ -3108,10 +3133,121 @@ $("#thread").addEventListener("keydown", e => {
   if (e.target.matches(".pp-url") && e.key === "Enter" && S.project) { e.preventDefault(); addProjectLink(S.project); }
 });
 
+// Базовые правила для любой модели: дата и как оформлять ответ. Без них каждая модель пишет «как привыкла».
+function baseRules(chat) {
+  const now = new Date();
+  const date = now.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  const time = now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const model = findModel("text", chat?.model)?.name || chat?.model || "";
+  return `Ты — ИИ-помощник в приложении «И ВСЕ 3,14здец»${model ? ` (модель ${model})` : ""}. Сегодня ${date}, ${time} по времени пользователя. Отвечай на языке пользователя.
+
+Как отвечать:
+- Начинай сразу с ответа или результата. Без вступлений («Отличный вопрос!», «Конечно»), без пересказа вопроса и без дежурных фраз в конце («Если будут вопросы — обращайтесь»).
+- Длина — по вопросу: на простой вопрос хватит пары предложений; подробно — когда тема сложная или просят.
+- Пиши связным текстом. Списки — для шагов, перечней и вариантов, а не для каждой мысли; вложенность не глубже двух уровней.
+- Заголовки (##) — только в длинных ответах из нескольких частей. Жирным выделяй немногое: главный вывод, важное предупреждение.
+- Сравнение нескольких вариантов по нескольким признакам — таблицей Markdown.
+- Формулы — LaTeX: $…$ в строке, $$…$$ отдельной строкой.
+- Не знаешь или не уверен — так и скажи. Не выдумывай факты, ссылки, цифры, функции и версии программ.
+- Просьба неоднозначна — выбери самое вероятное понимание, одной фразой скажи какое и отвечай. Переспрашивай, только если без ответа никак.
+- Помни всю переписку: опирайся на то, о чём уже договорились, не переспрашивай известное и не повторяй уже сказанное.
+
+Код:
+- Любой код, команды и настройки — в блоке \`\`\` с языком (\`\`\`js, \`\`\`bash, \`\`\`html…). Имена файлов, функций и переменных в тексте — в \`обратных кавычках\`.
+- Перед блоком — одна строка: что это и куда вставить (файл и место). После — как проверить, если это не очевидно.
+- Исправление существующего кода: покажи только изменённое место с парой соседних строк для ориентира, а не весь файл (если не просили целиком).
+- Новый файл или программа — целиком и рабочими: без заглушек «…остальной код…», TODO и выдуманных библиотек.
+- Ошибку сначала объясни (причина в одной-двух фразах), потом исправь.
+- Пользователь не программист: шаги «что нажать и куда вставить» — простыми словами.
+
+Сложная задача (расчёт, логика, код, план): сначала продумай решение и проверь себя — расчёты, крайние случаи, совпадает ли с просьбой. В ответе — итог и короткое объяснение, без черновика рассуждений.`;
+}
+
+// ================= Память чата: длинная переписка сжимается в сводку =================
+// Модель помнит ограниченный объём текста. Когда переписка подходит к пределу, старые сообщения
+// заменяются сводкой (она хранится в чате), а последние сообщения идут как есть.
+const ctxOf = chat => Math.min(findModel("text", chat.model)?.context || 128_000, 200_000);
+const KEEP_TAIL = 6;
+const tokensOf = m => {
+  if (!m) return 0;
+  if (typeof m.content === "string") return Math.ceil(m.content.length / 3.2) + 4;
+  if (Array.isArray(m.content)) return m.content.reduce((n, p) => n + (p.type === "text" ? Math.ceil((p.text || "").length / 3.2) : 1100), 4);
+  return 4;
+};
+const msgSig = m => m ? `${m.role}:${String(m.content || "").length}:${String(m.content || "").slice(0, 80)}` : "";
+// История для модели: [сжатая часть → в systemNote] + последние сообщения. frac — какую долю памяти можно занять.
+async function chatHistory(chat, system, frac, controller, onCompact) {
+  const all = chat.messages.slice(0, -1);
+  const usable = (m) => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content;
+  let sum = chat.summary;
+  // сводка устарела (сообщения удалили или изменили) — забываем её
+  if (sum && (sum.upTo > all.length || msgSig(all[sum.upTo - 1]) !== sum.sig)) { sum = null; delete chat.summary; }
+  const from = sum?.upTo || 0;
+  const toList = start => blindSafe(chat, all.slice(start).filter(usable).map(toApi));
+  let history = toList(from);
+  const limit = ctxOf(chat) * frac;
+  const total = () => tokensOf({ content: system + (sum?.text || "") }) + history.reduce((n, m) => n + tokensOf(m), 0);
+  if (total() > limit && all.length - from > KEEP_TAIL + 1) {
+    // режем по сообщению пользователя, чтобы хвост начинался с вопроса
+    let cut = all.length - KEEP_TAIL;
+    while (cut > from && all[cut].role !== "user") cut--;
+    // сжимать есть смысл, только если уходит заметный кусок (иначе сводка делалась бы на каждом сообщении)
+    const gain = all.slice(from, cut).filter(usable).map(toApi).reduce((n, m) => n + tokensOf(m), 0);
+    if (cut > from && gain > limit * 0.2) {
+      onCompact?.();
+      const text = await summarizeChat(chat, sum?.text || "", all.slice(from, cut).filter(usable), controller);
+      sum = chat.summary = { upTo: cut, sig: msgSig(all[cut - 1]), text, at: Date.now() };
+      history = toList(cut);
+    }
+  }
+  const note = sum ? `Начало этого разговора (${plural(sum.upTo, "сообщение", "сообщения", "сообщений")}) сжато в сводку, чтобы поместиться в память. Опирайся на неё как на часть переписки:\n<summary>\n${sum.text}\n</summary>` : "";
+  return { history, note };
+}
+async function summarizeChat(chat, prev, msgs, controller) {
+  const budget = ctxOf(chat) * 0.5 * 3.2;   // символов текста, чтобы запрос на сводку сам влез в память
+  const clip = (t, n) => t.length > n ? t.slice(0, n * 0.7) + "\n…\n" + t.slice(-n * 0.3) : t;
+  let lines = msgs.map(m => {
+    const a = toApi(m);
+    const text = typeof a.content === "string" ? a.content : a.content.filter(p => p.type === "text").map(p => p.text).join("\n");
+    return `${m.role === "user" ? "Пользователь" : "Ассистент"}: ${clip(text, 6000)}`;
+  });
+  while (lines.join("\n\n").length > budget && lines.length > 1) lines.shift();
+  const ask = `Сожми переписку ниже в сводку, по которой можно продолжить разговор без потерь. Пиши на языке переписки, плотно, без вступлений:
+1) кто пользователь и чего он хочет в целом; 2) о чём договорились, какие решения приняты и почему; 3) важные факты, цифры, имена, пути к файлам, ссылки, куски кода, без которых не продолжить (код — как есть, в блоках); 4) что пользователю понравилось и что нет (стиль, формат); 5) что осталось нерешённым.
+${prev ? `\nПрошлая сводка (включи её содержание в новую):\n${prev}\n` : ""}
+Переписка:
+${lines.join("\n\n")}`;
+  const body = requestBody(chat, [{ role: "user", content: ask }], { stream: false, max_tokens: 3000 });
+  delete body.stream_options;
+  body.venice_parameters = { ...body.venice_parameters, include_venice_system_prompt: false, disable_thinking: true, strip_thinking_response: true };
+  const res = await fetch("/api/chat", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error("Не удалось сжать историю чата: " + readError(await res.text()));
+  const j = await res.json();
+  if (j.usage) logUsage({ kind: "text", model: chat.model, inTok: j.usage.prompt_tokens || 0, outTok: j.usage.completion_tokens || 0,
+    usd: j.cost?.usd ?? textCost(chat.model, j.usage.prompt_tokens || 0, j.usage.completion_tokens || 0), note: "summary" });
+  const text = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content.trim();
+  if (!text) throw new Error("Не удалось сжать историю чата: пустая сводка");
+  return text;
+}
+// Индикатор «Память»: сколько памяти модели занял последний запрос этого чата
+function renderCtxMeter() {
+  const el = $("#ctxMeter");
+  if (!el) return;
+  const used = S.chat?.ctxIn;
+  if (!S.chat || !used || S.settings.mode !== "chat") { el.hidden = true; return; }
+  const pct = Math.min(100, Math.round(used / ctxOf(S.chat) * 100));
+  el.hidden = false;
+  el.textContent = `Память ${pct}%`;
+  el.className = "ctx-meter" + (pct >= 60 ? " high" : "");
+  el.title = `Последний запрос занял ${used.toLocaleString("ru-RU")} из ${ctxOf(S.chat).toLocaleString("ru-RU")} токенов памяти модели.` +
+    (S.chat.summary ? ` Начало чата (${S.chat.summary.upTo} сообщ.) сжато в сводку.` : " Когда чат станет длинным, начало сожмётся в сводку само.");
+}
+
 // Системный промпт = общие настройки + инструкции и файлы проекта
 async function systemPrompt(chat) {
   const parts = [];
-  if (S.settings.system.trim()) parts.push(S.settings.system.trim());
+  if (S.settings.baseRules !== false) parts.push(baseRules(chat));
+  if (S.settings.system.trim()) parts.push(`Указания пользователя (важнее правил выше):\n${S.settings.system.trim()}`);
   const p = await loadProject(chat.projectId);
   if (p) {
     parts.push(`Этот чат — часть проекта «${p.name}».${p.description ? " " + p.description : ""}`);

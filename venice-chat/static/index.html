@@ -87,6 +87,7 @@
           <div class="spacer"></div>
           <select id="aspect" class="mini" title="Соотношение сторон" hidden></select>
           <select id="resolution" class="mini" title="Разрешение" hidden></select>
+          <span id="ctxMeter" class="ctx-meter" hidden></span>
           <select id="model" title="Модель"></select>
           <button id="send" class="send" title="Отправить"></button>
         </div>
@@ -162,6 +163,10 @@
     <label class="field">
       <span>Лимит на одну задачу с папкой, $ <small>— модель остановится и спросит, продолжать ли</small></span>
       <input type="number" id="setBudget" min="0.05" step="0.05" placeholder="1">
+    </label>
+    <label class="check">
+      <input type="checkbox" id="setBaseRules">
+      <span>Правила оформления ответов от приложения <small>(дата, аккуратный текст и код — для любой модели)</small></span>
     </label>
     <label class="check">
       <input type="checkbox" id="setVeniceSystem">
