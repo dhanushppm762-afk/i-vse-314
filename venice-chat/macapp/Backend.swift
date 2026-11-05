@@ -179,6 +179,8 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
             fetchURL(t, body: body)
         case (_, "usage"):
             usage(t, method: method, body: body)
+        case ("POST", "balance"):
+            balance(t)
         case (_, "key"):
             key(t, method: method, body: body)
         case (_, "chats"), (_, "projects"):
@@ -274,6 +276,25 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
         if let c = spec["availableContextTokens"] ?? m["context_length"] { out["context"] = c }
         if let price { out["price"] = price }
         return out
+    }
+
+    // Баланс прямо из Venice (GET /api_keys/rate_limits) — после пополнения не нужно ждать следующего запроса
+    private func balance(_ t: WKURLSchemeTask) {
+        guard !apiKey.isEmpty else { return json(t, 200, ["balance": NSNull()]) }
+        URLSession.shared.dataTask(with: veniceRequest("/api_keys/rate_limits", method: "GET")) { [self] data, resp, _ in
+            var bal: [String: Any]? = nil
+            if let data, (resp as? HTTPURLResponse)?.statusCode == 200,
+               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let b = (root["data"] as? [String: Any])?["balances"] as? [String: Any],
+               let usd = (b["USD"] as? NSNumber)?.doubleValue {
+                var v: [String: Any] = ["usd": usd, "at": Int(Date().timeIntervalSince1970 * 1000)]
+                if let d = (b["DIEM"] as? NSNumber)?.doubleValue, d > 0 { v["diem"] = d }
+                if let c = (b["BUNDLED_CREDITS"] as? NSNumber)?.doubleValue, c > 0 { v["credits"] = c }
+                bal = v
+                withUsage { u in u["balance"] = v }
+            }
+            DispatchQueue.main.async { [self] in json(t, 200, ["balance": bal ?? NSNull()]) }
+        }.resume()
     }
 
     private func rememberBalance(_ resp: HTTPURLResponse) {

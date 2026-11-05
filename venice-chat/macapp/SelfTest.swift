@@ -78,6 +78,8 @@ setTimeout(() => ac.abort(), 2500);
 try { for (;;) { const { done } = await lr.read(); if (done) break; got++; } r.aborted = false; } catch (e) { r.aborted = e.name; }
 r.chunksBeforeStop = got;
 r.aliveAfterStop = (await fetch("/api/key")).status === 200;
+const bl = await (await fetch("/api/balance", { method: "POST" })).json();
+r.balance = bl.balance ? "$" + bl.balance.usd : "нет данных";
 const upd = await (await fetch("/api/update")).json();
 r.update = upd.current + (upd.available ? " → " + upd.latest : " (новее нет" + (upd.error ? ": " + upd.error : "") + ")");
 r.updateUI = typeof window.checkForUpdates === "function";

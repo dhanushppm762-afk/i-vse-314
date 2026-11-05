@@ -2468,7 +2468,7 @@ function showSettingsTab(tab) {
   document.querySelectorAll("#settingsTabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
   document.querySelectorAll("#settings .tab-pane").forEach(p => { p.hidden = p.dataset.pane !== tab; });
   dlg.classList.toggle("wide", tab === "usage");
-  if (tab === "usage") renderUsage();
+  if (tab === "usage") { renderUsage(); refreshBalance(); }
 }
 $("#settingsTabs").addEventListener("click", e => {
   const b = e.target.closest("[data-tab]");
@@ -2661,12 +2661,24 @@ async function renderUsageMini() {
   }).join("");
   el.innerHTML = `<div class="um-top"><span class="um-lbl">Сегодня</span><span class="um-val">${fmtUsd(t.usd)}${t.n ? `<small>${t.n} запр.</small>` : ""}</span></div>
     <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="Расходы за 14 дней">${bars}</svg>
-    <div class="um-row"><span>Месяц <b>${fmtUsd(monthUsd)}</b></span><span>Баланс <b>${bal ? fmtUsd(bal.usd) : "—"}</b></span></div>`;
+    <div class="um-row"><span>Месяц <b>${fmtUsd(monthUsd)}</b></span><span title="${bal ? `Обновлён ${relTime(bal.at)}${bal.diem ? ` · DIEM: ${bal.diem}` : ""}${bal.credits ? ` · бонусные кредиты: ${fmtUsd(bal.credits)}` : ""}` : ""}">Баланс <b>${bal ? fmtUsd(bal.usd) : "—"}</b></span></div>`;
   el.hidden = false;
 }
 $("#usageMini").onclick = () => { $("#settingsBtn").click(); showSettingsTab("usage"); };
+// баланс спрашиваем у Venice при запуске, при возвращении в окно (не чаще раза в минуту) и каждые 10 минут
+let balanceAt = 0;
+async function refreshBalance(force = false) {
+  if (!force && Date.now() - balanceAt < 60_000) return;
+  balanceAt = Date.now();
+  try { await fetch("/api/balance", { method: "POST" }); } catch {}
+  renderUsageMini();
+  if (dlg.open && !$('#settings [data-pane="usage"]').hidden) renderUsage();
+}
 renderUsageMini();
-setInterval(renderUsageMini, 10 * 60 * 1000);   // смена дня и баланс
+refreshBalance(true);
+setInterval(() => refreshBalance(true), 10 * 60 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshBalance(); });
+window.addEventListener("focus", () => refreshBalance());
 
 function usageFoot() {
   return `<div class="u-foot"><span>Считается в этом приложении на этом компьютере. Текст — точная стоимость от Venice, картинки — по ценам моделей (≈).</span>` +

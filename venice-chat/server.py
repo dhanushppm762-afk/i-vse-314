@@ -143,6 +143,31 @@ def remember_balance(headers):
         write_json(DATA / "usage.json", u)
 
 
+def fetch_balance():
+    """Баланс прямо из Venice (GET /api_keys/rate_limits), без ожидания следующего запроса к модели."""
+    if not KEY:
+        return None
+    status, _, raw = venice("GET", "/api_keys/rate_limits")
+    if status != 200:
+        return None
+    try:
+        b = (json.loads(raw).get("data") or {}).get("balances") or {}
+    except Exception:
+        return None
+    if b.get("USD") is None:
+        return None
+    bal = {"usd": float(b["USD"]), "at": int(time.time() * 1000)}
+    if b.get("DIEM"):
+        bal["diem"] = float(b["DIEM"])
+    if b.get("BUNDLED_CREDITS"):
+        bal["credits"] = float(b["BUNDLED_CREDITS"])
+    with _lock:
+        u = read_json(DATA / "usage.json", {"events": []})
+        u["balance"] = bal
+        write_json(DATA / "usage.json", u)
+    return bal
+
+
 # ---------- файлы ----------
 def read_json(path, default):
     try:
@@ -276,6 +301,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.fetch_url()
             if path == "/api/usage":
                 return self.usage(method)
+            if path == "/api/balance" and method == "POST":
+                return self.send(200, {"balance": fetch_balance()})
             if path == "/api/key":
                 return self.error(404, "Смена ключа есть только в приложении для Mac")
             m = re.fullmatch(r"/api/fs/(\w+)", path)
