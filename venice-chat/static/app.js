@@ -2851,7 +2851,9 @@ async function reviewChanges(chat, msg, convo, controller) {
 Стиль, «можно было бы лучше» и мелочи не пиши. Ничего не меняй (у тебя и нет таких инструментов).
 Ответ: если проблем нет — ровно одно слово ОК. Иначе — нумерованный список, до 5 пунктов: файл:строка — что не так — как исправить. Без вступлений.` });
     const report = r.report.trim();
-    const issues = report && !/^(ок|ok)\b[.!]?$/i.test(report.split("\n")[0].trim()) && report !== "(помощник не дал ответа)";
+    // \b не работает с русскими буквами, поэтому «ОК» проверяем без него; «ОК» с короткой припиской — тоже без замечаний
+    const okFirst = /^[*_\s]*(ок|ok)(?![а-яёa-z])/i.test(report.split("\n")[0].trim());
+    const issues = report && !(okFirst && report.length < 300) && report !== "(помощник не дал ответа)";
     step.status = "ok";
     step.text = issues ? `Проверяющий нашёл замечания — ИИ их исправляет` : "Проверяющий: замечаний нет";
     if (issues) step.output = shortText(report, 1200);
