@@ -61,7 +61,7 @@ final class BrowserPanel: NSView, WKNavigationDelegate, WKUIDelegate, NSTextFiel
         let line = NSBox(); line.boxType = .separator
         for v in [bar, line, webView] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
         NSLayoutConstraint.activate([
-            bar.topAnchor.constraint(equalTo: topAnchor), bar.leadingAnchor.constraint(equalTo: leadingAnchor), bar.trailingAnchor.constraint(equalTo: trailingAnchor),
+            bar.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor),   // ниже заголовка окна, иначе кнопки не нажимаются bar.leadingAnchor.constraint(equalTo: leadingAnchor), bar.trailingAnchor.constraint(equalTo: trailingAnchor),
             line.topAnchor.constraint(equalTo: bar.bottomAnchor), line.leadingAnchor.constraint(equalTo: leadingAnchor), line.trailingAnchor.constraint(equalTo: trailingAnchor),
             webView.topAnchor.constraint(equalTo: line.bottomAnchor), webView.leadingAnchor.constraint(equalTo: leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: trailingAnchor), webView.bottomAnchor.constraint(equalTo: bottomAnchor),
