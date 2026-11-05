@@ -926,18 +926,12 @@ async function runCompletion(chat) {
 
   try {
     await prepareImages(chat);
-    const messages = chat.messages.slice(0, -1).filter(m => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content).map(toApi);
+    const messages = blindSafe(chat, chat.messages.slice(0, -1).filter(m => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content).map(toApi));
     const system = await systemPrompt(chat);
     if (system) messages.unshift({ role: "system", content: system });
 
-    const res = await fetch("/api/chat", {
-      method: "POST", signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody(chat, messages, { webSearch: "auto" })),   // модели без инструментов: поиск Venice сам, когда нужен
-    });
-    if (!res.ok) throw new Error(readError(await res.text()));
-
-    const reader = res.body.getReader();
+    // модели без инструментов: поиск Venice сам, когда нужен
+    const reader = await streamRequest(requestBody(chat, messages, { webSearch: "auto" }), controller);
     const decoder = new TextDecoder();
     let buf = "", thinkStart = 0;
     for (;;) {
@@ -1846,18 +1840,78 @@ function maskOldResults(convo) {
 // служебные поля разговора не отправляем модели
 const apiMsg = ({ screenshot, kind, tool, masked, ...m }) => m;
 
-// Один запрос к модели с инструментами; текст показывается по мере поступления
-async function agentTurn(chat, msg, convo, controller, tools) {
-  const res = await fetch("/api/chat", {
-    method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestBody(chat, convo.map(apiMsg), tools.length ? { tools, tool_choice: "auto" } : {})),
+// Сторож тишины: если Venice ничего не присылает (ни текста, ни рассуждений), запрос обрывается,
+// а не висит минутами с «…». Первый ответ ждём дольше — модель может долго начинать.
+const SILENT_FIRST = 120_000, SILENT_NEXT = 90_000;
+class SilentError extends Error {}
+// Модель без зрения: картинки заменяем пометкой, иначе Venice может долго молчать или вернуть ошибку
+function blindSafe(chat, messages) {
+  const m = findModel("text", chat.model);
+  if (!m || m.vision) return messages;
+  let dropped = 0;
+  const out = messages.map(x => {
+    if (!Array.isArray(x.content)) return x;
+    const parts = x.content.filter(p => p.type !== "image_url");
+    const n = x.content.length - parts.length;
+    if (!n) return x;
+    dropped += n;
+    parts.push({ type: "text", text: `[Пользователь приложил ${plural(n, "картинку", "картинки", "картинок")}, но эта модель не видит изображения. Скажи об этом и предложи выбрать модель с пометкой 👁.]` });
+    return { ...x, content: parts };
   });
-  if (!res.ok) throw new Error(readError(await res.text()));
-  const reader = res.body.getReader(), decoder = new TextDecoder();
+  if (dropped) toast(`${m.name} не видит картинки — для них выберите модель с 👁`);
+  return out;
+}
+async function streamRequest(body, controller) {
+  const own = new AbortController();
+  const stop = () => own.abort();
+  controller.signal.addEventListener("abort", stop, { once: true });
+  let timer = 0, silent = false;
+  const arm = ms => { clearTimeout(timer); timer = setTimeout(() => { silent = true; own.abort(); }, ms); };
+  arm(SILENT_FIRST);
+  try {
+    const res = await fetch("/api/chat", { method: "POST", signal: own.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(readError(await res.text()));
+    const reader = res.body.getReader();
+    let got = false;
+    return {
+      get got() { return got; },
+      async read() {
+        try {
+          const r = await reader.read();
+          if (r.done) clearTimeout(timer); else { got = true; arm(SILENT_NEXT); }
+          return r;
+        } catch (e) { clearTimeout(timer); throw silent ? new SilentError(`Venice не отвечает ${Math.round((got ? SILENT_NEXT : SILENT_FIRST) / 1000)} с. Попробуйте ещё раз или другую модель.`) : e; }
+      },
+      done() { clearTimeout(timer); controller.signal.removeEventListener("abort", stop); },
+    };
+  } catch (e) {
+    clearTimeout(timer); controller.signal.removeEventListener("abort", stop);
+    if (silent && !controller.signal.aborted) throw new SilentError(`Venice не отвечает ${SILENT_FIRST / 1000} с. Попробуйте ещё раз или другую модель.`);
+    throw e;
+  }
+}
+
+// Один запрос к модели с инструментами; текст показывается по мере поступления.
+// Если Venice молчит до первого ответа — повторяем один раз, потом сообщаем.
+async function agentTurn(chat, msg, convo, controller, tools) {
+  for (let attempt = 1; ; attempt++) {
+    try { return await agentTurnOnce(chat, msg, convo, controller, tools); }
+    catch (e) {
+      if (!(e instanceof SilentError) || e.partial || attempt >= 2) throw e;
+      if (msg?.steps) { msg.steps.push({ status: "note", text: "Venice не отвечает — повторяю запрос" }); scheduleUpdate(chat, msg); }
+    }
+  }
+}
+async function agentTurnOnce(chat, msg, convo, controller, tools) {
+  const stream = await streamRequest(requestBody(chat, convo.map(apiMsg), tools.length ? { tools, tool_choice: "auto" } : {}), controller);
+  const decoder = new TextDecoder();
   const calls = [];
   let buf = "", content = "", usage = null;
+  try {
   for (;;) {
-    const { value, done } = await reader.read();
+    let r;
+    try { r = await stream.read(); } catch (e) { if (e instanceof SilentError && (content || calls.length)) e.partial = true; throw e; }
+    const { value, done } = r;
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     const lines = buf.split("\n");
@@ -1882,6 +1936,7 @@ async function agentTurn(chat, msg, convo, controller, tools) {
     }
     if (msg) scheduleUpdate(chat, msg);
   }
+  } finally { stream.done(); }
   return { content, calls: calls.filter(c => c.name).map((c, i) => ({ ...c, id: c.id || `call_${Date.now()}_${i}` })), usage };
 }
 
@@ -1902,7 +1957,7 @@ async function runAgent(chat) {
   const total = { in: 0, out: 0, usd: 0, any: false };
   try {
     await prepareImages(chat);
-    const history = chat.messages.slice(0, -1).filter(m => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content).map(toApi);
+    const history = blindSafe(chat, chat.messages.slice(0, -1).filter(m => m.role === "user" || m.kind === "image" || m.steps?.length || splitThink(m).content).map(toApi));
     const page = useBrowser ? await browserCmd("status").catch(() => ({})) : {};
     let info = null;
     if (folder) {
