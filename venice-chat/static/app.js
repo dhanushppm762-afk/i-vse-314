@@ -403,11 +403,27 @@ function updateMessage(chat, m) {
   const old = $(`.msg[data-idx="${i}"]`, $("#thread"));
   if (!old) return renderThread();
   const body = $(".think-body", old);
-  const thinkScroll = body ? body.scrollTop : 0;
+  const atEnd = !body || body.scrollHeight - body.scrollTop - body.clientHeight < 24;
   const fresh = messageNode(m, i);
-  old.replaceWith(fresh);
-  const nb = $(".think-body", fresh);
-  if (nb) nb.scrollTop = S.stream?.msg === m ? nb.scrollHeight : thinkScroll;
+  // Блок размышлений не трогаем, а меняем всё вокруг него: при потоке сообщение перерисовывается каждый кадр,
+  // и если блок пересоздать или хотя бы переставить, клик по «Размышления» теряется
+  const oldD = $(":scope > .think", old), newD = $(":scope > .think", fresh);
+  let node = fresh;
+  if (oldD && newD) {
+    const os = $("summary", oldD), ns = $("summary", newD);
+    if (os.innerHTML !== ns.innerHTML) os.innerHTML = ns.innerHTML;
+    const ob = $(".think-body", oldD), nb2 = $(".think-body", newD);
+    if (ob.textContent !== nb2.textContent) ob.textContent = nb2.textContent;
+    const kids = [...fresh.childNodes], k = kids.indexOf(newD);
+    for (const c of [...old.childNodes]) if (c !== oldD) c.remove();
+    oldD.before(...kids.slice(0, k));
+    oldD.after(...kids.slice(k + 1));
+    for (const a of [...old.attributes]) if (!fresh.hasAttribute(a.name)) old.removeAttribute(a.name);
+    for (const a of [...fresh.attributes]) if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
+    node = old;
+  } else old.replaceWith(fresh);
+  const nb = $(".think-body", node);
+  if (nb && S.stream?.msg === m && atEnd) nb.scrollTop = nb.scrollHeight;
   if (S.stick) scrollToBottom();
 }
 
