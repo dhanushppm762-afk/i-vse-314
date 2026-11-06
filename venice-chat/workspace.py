@@ -3,6 +3,7 @@
 Модель видит только папки, которые пользователь сам выбрал. При изменениях правь оба файла.
 """
 import base64
+import errno
 import fnmatch
 import json
 import os
@@ -482,10 +483,20 @@ class Workspace:
         if not bid or meta.get("root") != str(r):
             raise FsError("Копия для отмены не найдена")
         p = self.resolve(r, meta["path"])
-        if meta.get("existed"):
-            shutil.copy2(d / "file", p)
-        elif p.exists():
-            p.unlink()
+        if meta.get("existed") and not (d / "file").is_file():
+            raise FsError("Копия для отмены не найдена")
+        if p.is_dir():
+            raise FsError(f"На месте файла {meta['path']} теперь папка")
+        try:
+            if meta.get("existed"):
+                p.parent.mkdir(parents=True, exist_ok=True)   # папку файла могла переместить или стереть команда
+                shutil.copy2(d / "file", p)
+            elif p.exists() or p.is_symlink():
+                p.unlink()
+        except OSError as e:
+            why = {errno.ENOSPC: "на диске нет места", errno.EACCES: "нет прав на запись", errno.EPERM: "нет прав на запись",
+                   errno.ENOTDIR: "на месте его папки теперь файл", errno.EEXIST: "на месте его папки теперь файл"}.get(e.errno, "ошибка записи")
+            raise FsError(f"Не удалось вернуть {meta['path']}: {why}")
         return {"ok": True, "path": meta["path"]}
 
     @staticmethod

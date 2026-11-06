@@ -385,9 +385,22 @@ final class Workspace {
         guard !id.isEmpty, let meta = (try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meta.json")))) as? [String: Any],
               meta["root"] as? String == r.path else { throw FsError("Копия для отмены не найдена") }
         let url = try resolve(r, meta["path"])
+        let path = meta["path"] as? String ?? ""
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue { throw FsError("На месте файла \(path) теперь папка") }
         if meta["existed"] as? Bool == true {
-            let data = try Data(contentsOf: dir.appendingPathComponent("file"))
-            try data.write(to: url, options: .atomic)
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("file")) else { throw FsError("Копия для отмены не найдена") }
+            do {
+                // папку файла могла переместить или стереть команда
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                let e = error as NSError
+                let why = e.code == NSFileWriteOutOfSpaceError ? "на диске нет места"
+                    : e.code == NSFileWriteNoPermissionError ? "нет прав на запись"
+                    : e.code == NSFileWriteFileExistsError ? "на месте его папки теперь файл" : "ошибка записи"
+                throw FsError("Не удалось вернуть \(path): \(why)")
+            }
         } else {
             try? FileManager.default.removeItem(at: url)
         }

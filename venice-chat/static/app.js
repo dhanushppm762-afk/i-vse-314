@@ -250,9 +250,9 @@ $("#chatList").addEventListener("click", async e => {
   if (act === "delete") {
     const meta = S.chats.find(c => c.id === id);
     if (!confirm(`Удалить чат «${meta?.title || "Новый чат"}»?`)) return;
+    const gone = S.cache.get(id); if (gone) gone.deleted = true;   // до «Стоп»: иначе ответ, завершаясь, сохранит чат заново
     S.streams.get(id)?.controller.abort();
     await api.remove(id);
-    const gone = S.cache.get(id); if (gone) gone.deleted = true;
     S.chats = S.chats.filter(c => c.id !== id);
     S.cache.delete(id);
     if (S.chat?.id === id) newChat(); else renderList();
@@ -746,10 +746,10 @@ async function send() {
   autoGrow();
   renderThread();
   scrollToBottom(true);
-  const first = S.chat.messages.length === 1;
-  persist(S.chat);
-  await respond(S.chat);
-  if (first) autoTitle(S.chat);
+  const first = S.chat.messages.length === 1, chat = S.chat;   // пока идёт ответ, пользователь может открыть другой чат
+  persist(chat);
+  await respond(chat);
+  if (first) autoTitle(chat);
 }
 
 // ================= Ссылки: GitHub, страницы, файлы =================
@@ -944,9 +944,9 @@ async function sendImage(mode) {
     files = [{ name: "картинка." + imageExt(src), kind: "image", data: src }];
   }
   const params = { model: $("#model").value, aspect: $("#aspect").hidden ? null : $("#aspect").value, resolution: $("#resolution").hidden ? null : $("#resolution").value };
-  const first = startTurn({ role: "user", content: text, mode, params, ...(files.length ? { files } : {}) });
-  await runImage(S.chat);
-  if (first) autoTitle(S.chat);
+  const first = startTurn({ role: "user", content: text, mode, params, ...(files.length ? { files } : {}) }), chat = S.chat;
+  await runImage(chat);
+  if (first) autoTitle(chat);
 }
 
 async function upscale(src) {
@@ -1190,6 +1190,7 @@ async function updateDigest(chat) {
 }
 
 async function autoTitle(chat) {
+  if (chat.deleted) return;
   const first = chat.messages.find(m => m.role === "user");
   const seed = (first?.content || first?.files?.map(f => f.name).join(", ") || "").slice(0, 800);
   if (!seed) return;
@@ -1885,13 +1886,16 @@ async function prepareWorkCopy(chat, msg, signal) {
     const a = f.archive;
     // причина «только читать» могла пройти: папку от чата отключили, другую копию убрали,
     // распаковка сорвалась (пробуем ещё раз, но только один)
-    if (a && ((a.roFolder && a.roFolder !== current?.path) || a.roTemp || a.roRetry === 1)) { delete a.readOnly; delete a.roFolder; delete a.roTemp; }
+    if (a && ((a.roFolder && a.roFolder !== current?.path) || a.roTemp || a.roFail || (a.roOther && !workArchive(chat, a.roOther)))) {
+      delete a.readOnly; delete a.roFolder; delete a.roTemp; delete a.roFail; delete a.roOther;
+    }
     if (!a || a.work || a.readOnly) continue;
     const code = a.tree.filter(t => AW.CODE_FILE.test(t[0])).length;
     // архив без кода (тексты) распаковываем, только когда его просят править и другой копии в работе нет;
     // пока в работе другая копия, модель должна знать, что этот архив только читается (иначе «исправит» его файл в чужой копии)
     if (!code && current?.work) {
-      a.readOnly = `сейчас ИИ правит архив «${current.name}»; чтобы править этот, его нужно прислать в новом чате`; a.roTemp = true;
+      a.readOnly = `сейчас ИИ правит ${current.name === a.name ? `другой архив с тем же именем («${a.name}»)` : `архив «${current.name}»`}; чтобы править этот, его нужно прислать в новом чате`;
+      a.roTemp = true;
       if (m === lastUser && EDIT_ASK.test(lastUser.content || "")) note(`Архив «${a.name}» ИИ только читает: ${a.readOnly}`);
       continue;
     }
@@ -1946,16 +1950,18 @@ async function prepareWorkCopy(chat, msg, signal) {
       (nb ? `; ${plural(nb, "большой файл", "больших файла", "больших файлов")} (больше 50 МБ) ${one(nb) ? "не распакован — останется как был" : "не распакованы — останутся как были"}` : "") +
       (nl ? `; ${plural(nl, "файл", "файла", "файлов")} со слишком длинным путём ${one(nl) ? "не распакован — останется как был" : "не распакованы — останутся как были"}` : "");
     // остальные архивы — только читаем (если распаковать не вышло, в следующий раз они снова в очереди)
+    // (тот же архив, присланный ещё раз, без пометки: модель знает его как прежнюю версию)
     for (const c of cands) if (c.a !== a && !c.a.readOnly) {
-      c.a.readOnly = `править можно один архив за раз — сейчас это «${a.name}»`;
-      note(`Архив «${c.a.name}» ИИ только читает: ${c.a.readOnly}`);
+      c.a.readOnly = `править можно один архив за раз — сейчас это «${a.name}»`; c.a.roOther = made.root;
+      if (c.a.name !== a.name) note(`Архив «${c.a.name}» ИИ только читает: ${c.a.readOnly}`);
     }
     persist(chat);
     if (S.chat === chat) { renderPending(); renderThread(); }   // пометка «ИИ правит копию» — уже на новом архиве
   } catch (e) {
     if (e.name === "AbortError") { step.status = "note"; step.text = "Остановлено — копия для правки не создана"; throw e; }
     a.readOnly = `не удалось распаковать: ${shortText(e.message, 80)}`;
-    a.roRetry = (a.roRetry || 0) + 1;   // сбой записи может быть временным — в следующий раз попробуем ещё раз (один)
+    a.roRetry = (a.roRetry || 0) + 1;
+    if (a.roRetry < 2) a.roFail = true;   // сбой записи может быть временным — в следующий раз попробуем ещё раз (один)
     step.status = "err"; step.text = `Архив «${a.name}» ИИ только читает: ${a.readOnly}`;
   }
 }
@@ -2005,32 +2011,38 @@ async function downloadArchive(chat, root) {
 async function revertDropped(chat, dropped) {
   const inCopy = st => st.status === "ok" && workArchive(chat, st.root);
   const steps = dropped.flatMap(m => (m.steps || []).filter(st => st.undo && !st.undone && inCopy(st)));
-  const cmds = dropped.some(m => (m.steps || []).some(st => st.cmd && workArchive(chat, st.root)));   // и упавшие: что-то они успели
+  const ran = m => (m.steps || []).some(st => st.cmd && workArchive(chat, st.root));   // и упавшие: что-то они успели
+  const cmds = dropped.some(ran);
   if (!steps.length && !cmds) return;
   // Если после первой убранной правки файла пользователь кнопкой «Отменить» вернул файл к состоянию до неё
-  // (отменил правку, сделанную раньше), откат вернул бы отменённое — такой файл оставляем как есть.
+  // (отменил правку, сделанную раньше), откат правок до этой отмены вернул бы отменённое — их не трогаем;
+  // правки после неё откатываем как обычно.
   // Что поменяли команды того же ответа, откатывается вместе с правками (копия файла — до первой правки).
   const key = st => st.root + "\n" + String(st.path).normalize("NFC").toLowerCase();
   const first = new Map();
   for (const st of steps) first.set(key(st), Math.min(first.get(key(st)) ?? Infinity, st.at ?? Infinity));
-  const keep = new Set();
+  const keepBefore = new Map();
   for (const m of [...chat.messages, ...dropped]) for (const st of m.steps || []) {
     const t = st.path && st.undoneAt ? first.get(key(st)) : undefined;
-    if (t !== undefined && st.undoneAt > t && (st.at ?? 0) < t) keep.add(key(st));
+    if (t !== undefined && st.undoneAt > t && (st.at ?? 0) < t) keepBefore.set(key(st), Math.max(keepBefore.get(key(st)) ?? 0, st.undoneAt));
   }
-  let failed = 0;
-  for (const st of steps.reverse()) {
-    if (keep.has(key(st))) continue;
-    try { await fsApi("undo", { root: st.root, backup: st.undo }); st.undo = null; st.undone = true; st.undoneAt = Date.now(); } catch { failed++; }
+  const skip = st => (st.at ?? 0) < (keepBefore.get(key(st)) ?? 0);
+  let failed = 0, done = 0;
+  for (const st of [...steps].reverse()) {
+    if (skip(st)) continue;
+    try { await fsApi("undo", { root: st.root, backup: st.undo }); st.undo = null; st.undone = true; st.undoneAt = Date.now(); done++; } catch { failed++; }
   }
-  if (!steps.length) return toast("То, что изменили команды прошлого ответа, осталось в копии", 5000);
-  const kept = new Set(steps.filter(st => keep.has(key(st))).map(key)).size;
+  const of = dropped.filter(m => ran(m) || (m.steps || []).some(st => steps.includes(st))).length > 1 ? "убранных ответов" : "прошлого ответа";
+  if (!steps.length) return toast(`То, что изменили команды ${of}, осталось в копии`, 5000);
+  if (!done && failed) return toast(`Не удалось отменить правки ${of}: файлы остались изменёнными`, 6000);
+  const kept = new Set(steps.map(key).filter(k => steps.every(st => key(st) !== k || skip(st)))).size;
   const notes = [
     kept && (kept === 1 ? "файл, где вы уже отменили более раннюю правку, оставлен как есть" : "файлы, где вы уже отменили более ранние правки, оставлены как есть"),
     failed && (failed === 1 ? "одну правку отменить не удалось" : `${plural(failed, "правку", "правки", "правок")} отменить не удалось`),
-    cmds && "то, что изменили команды, осталось в копии",
+    cmds && "то, что изменили команды, могло остаться в копии",   // в других файлах или до первой правки
   ].filter(Boolean);
-  toast(notes.length ? `Правки прошлого ответа отменены, но ${notes.join("; ")}` : "Правки прошлого ответа отменены — ИИ начнёт с тех же файлов", notes.length ? 6000 : 2200);
+  if (!done) return toast(notes.join("; ").replace(/^./, c => c.toUpperCase()), 6000);   // всё оставлено как есть
+  toast(notes.length ? `Правки ${of} отменены, но ${notes.join("; ")}` : `Правки ${of} отменены — ИИ начнёт с тех же файлов`, notes.length ? 6000 : 2200);
 }
 function dropOrphanCopies(chat, dropped) {   // копии архивов из убранных сообщений больше не нужны
   for (const m of dropped) for (const f of m.files || []) if (f.archive?.work) fsApi("drop", { root: f.archive.work.base }).catch(() => {});
@@ -3438,7 +3450,7 @@ async function undoStep(chat, m, st) {
     persist(chat);
     updateMessage(chat, m);
     toast("Правка отменена");
-  } catch (e) { toast("Не получилось отменить: " + e.message); }
+  } catch (e) { toast(/[а-яё]/i.test(e.message) ? "Не получилось отменить: " + e.message : "Не получилось отменить правку"); }
 }
 
 // «Откатить все изменения»: отменяем правки ответа с последней к первой — каждая копия хранит файл до своей правки,
