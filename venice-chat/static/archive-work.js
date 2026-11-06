@@ -118,7 +118,9 @@ const AW = (() => {
     // время файла — когда его правили в копии (версия «<мкс>-<размер>»); JSZip пишет его по UTC-часам даты —
     // сдвигаем, чтобы в архиве было местное время
     const local = ms => new Date(ms - new Date(ms).getTimezoneOffset() * 60_000);
-    const editedAt = v => { const us = parseInt(v, 10); return local(us > 0 ? us / 1000 : Date.now()); };
+    // в zip помещаются годы 1980–2107: время за этими пределами (файл из «воспроизводимой» сборки с датой 1970) — к границе
+    const editedAt = v => { const us = parseInt(v, 10), d = local(us > 0 ? us / 1000 : Date.now()), y = d.getUTCFullYear();
+      return y < 1980 ? new Date(Date.UTC(1980, 0, 1)) : y > 2107 ? new Date(Date.UTC(2107, 11, 31, 23, 59, 58)) : d; };
     for (const [k, b] of was) {
       if (cur.has(k) || !b.entry || !zip.files[b.entry] || zip.files[b.entry].dir) continue;
       delete zip.files[b.entry]; gone.push(b.entry); report.deleted.push(k);

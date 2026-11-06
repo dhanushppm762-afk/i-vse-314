@@ -518,7 +518,34 @@ final class Workspace {
         while let pid = queue.popLast(), all.count < 500 { let k = kids(pid); all += k; queue += k }
         for pid in all.reversed() { kill(pid, sig) }
         if sig == SIGTERM { p.terminate() } else if p.isRunning { kill(p.processIdentifier, sig) }
+        if sig == SIGTERM {   // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко, как в Python-версии
+            let pids = all
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
         return all
+    }
+
+    /// pid процессов, чья рабочая папка внутри base (по lsof, кроме самого приложения): так находится и то,
+    /// что пережило свою оболочку (cmd &, вывод в файл) — его уже не видно через pgrep -P
+    private func pidsIn(_ base: String) -> [Int32] {
+        let q = Process(); q.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof"); q.arguments = ["-n", "-d", "cwd", "-F", "pn"]
+        let pipe = Pipe(); q.standardOutput = pipe; q.standardError = FileHandle.nullDevice
+        guard (try? q.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()   // до waitUntilExit: вывод больше буфера канала
+        q.waitUntilExit()
+        let me = getpid()
+        var out: [Int32] = [], pid: Int32 = 0
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            if line.hasPrefix("p") { pid = Int32(line.dropFirst()) ?? 0 }
+            else if line.hasPrefix("n"), pid > 0, pid != me {
+                let path = String(line.dropFirst())
+                if path == base || path.hasPrefix(base + "/") { out.append(pid) }
+            }
+        }
+        return out
     }
 
     /// Выход из приложения — фоновые команды не оставляем
@@ -694,12 +721,17 @@ final class Workspace {
         lock.unlock()
         var pids: [Int32] = []
         for p in procs { pids += stopTree(p) }   // иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+        // и то, что пережило свою оболочку и ещё работает в копии
+        let left = pidsIn(base).filter { !pids.contains($0) }
+        for pid in left { kill(pid, SIGTERM) }
+        pids += left
         let alive = { (pid: Int32) -> Bool in kill(pid, 0) == 0 }
         let until = Date().addingTimeInterval(3)
         while (procs.contains(where: { $0.isRunning }) || pids.contains(where: alive)) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
-        // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко
+        // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко; и то, что появилось за это время
         for p in procs where p.isRunning { stopTree(p, SIGKILL) }
         for pid in pids where alive(pid) { kill(pid, SIGKILL) }
+        for pid in pidsIn(base) { kill(pid, SIGKILL) }
         foldersLock.lock()
         allowed = allowed.filter { $0 != base && !$0.hasPrefix(base + "/") }
         foldersLock.unlock()

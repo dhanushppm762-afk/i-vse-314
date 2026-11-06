@@ -96,19 +96,14 @@ class Workspace:
         inside = lambda p: p == base or p.startswith(base + "/")
         procs = []
         for job in list(self.jobs.values()):
-            # оболочка могла уже выйти, а запущенное ею (cmd &) ещё работает — его выдаёт живой поток чтения вывода
-            pump = job.get("pump")
-            if inside(job["root"]) and (job["proc"].poll() is None or (pump and pump.is_alive())):
+            if inside(job["root"]) and job["proc"].poll() is None:
                 job["stopped"] = True
                 procs.append(job["proc"])
-        procs += [proc for root, proc in list(self.running.values()) if inside(root)]   # команда в списке, пока не вернулась
+        # команда в списке, пока не вернулась; poll() не зовём — он «забрал» бы уже вышедшую оболочку
+        procs += [proc for root, proc in list(self.running.values()) if inside(root) and proc.returncode is None]
         for proc in procs:   # иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
             self.stop_tree(proc)
-        for proc in procs:   # и то, что пережило оболочку или не слушает SIGTERM, — жёстко
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
+        self.stop_left(base)
         with self.folders_lock:
             items = self.allowed()
             keep = [p for p in items if p != base and not p.startswith(base + "/")]
@@ -521,8 +516,7 @@ class Workspace:
                 with job["lock"]:
                     if len(job["out"]) < 4_000_000:
                         job["out"] += chunk
-        job["pump"] = threading.Thread(target=pump, daemon=True)
-        job["pump"].start()
+        threading.Thread(target=pump, daemon=True).start()
         self.job_count += 1
         jid = f"job{self.job_count}"
         self.jobs[jid] = job
@@ -567,6 +561,49 @@ class Workspace:
                 os.killpg(proc.pid, signal.SIGKILL)
             except Exception:
                 proc.kill()
+
+    @staticmethod
+    def pids_in(base):
+        """pid процессов, чья рабочая папка внутри base (кроме самого сервера)."""
+        inside = lambda p: p == base or p.startswith(base + "/")
+        me, out = os.getpid(), []
+        if Path("/proc/self/cwd").exists():   # Linux
+            for d in os.listdir("/proc"):
+                if d.isdigit() and int(d) != me:
+                    try:
+                        if inside(os.readlink(f"/proc/{d}/cwd")):
+                            out.append(int(d))
+                    except OSError:
+                        pass
+            return out
+        try:   # Mac
+            lsof = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").exists() else "lsof"
+            res = subprocess.run([lsof, "-n", "-d", "cwd", "-F", "pn"], capture_output=True, timeout=15)
+        except Exception:
+            return out
+        pid = 0
+        for line in res.stdout.decode("utf-8", errors="replace").splitlines():
+            if line[:1] == "p":
+                pid = int(line[1:]) if line[1:].isdigit() else 0
+            elif line[:1] == "n" and pid and pid != me and inside(line[1:]):
+                out.append(pid)
+        return out
+
+    def stop_left(self, base):
+        """То, что пережило свою оболочку (cmd &, setsid, вывод в файл) и ещё работает в папке: SIGTERM, через 3 с — SIGKILL."""
+        def send(sig):
+            for pid in self.pids_in(base):
+                try:
+                    os.kill(pid, sig)
+                except Exception:
+                    pass
+        if not self.pids_in(base):
+            return
+        send(signal.SIGTERM)
+        end = time.time() + 3
+        while time.time() < end and self.pids_in(base):
+            time.sleep(0.2)
+        send(signal.SIGKILL)
 
     def stop_all_jobs(self):
         for job in self.jobs.values():
