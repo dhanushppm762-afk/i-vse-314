@@ -391,7 +391,7 @@ final class Workspace {
         } else {
             try? FileManager.default.removeItem(at: url)
         }
-        return ["ok": true, "path": meta["path"] as? String ?? "", "version": version(url) ?? ""]
+        return ["ok": true, "path": meta["path"] as? String ?? ""]
     }
 
     private func run(_ r: URL, _ body: [String: Any], id: ObjectIdentifier) throws -> [String: Any] {
@@ -504,8 +504,9 @@ final class Workspace {
         return out
     }
 
-    /// Останавливает команду вместе с запущенными ею процессами (npm, сервер и т. п.)
-    private func stopTree(_ p: Process) {
+    /// Останавливает команду вместе с запущенными ею процессами (npm, сервер и т. п.); возвращает pid найденных потомков
+    @discardableResult
+    private func stopTree(_ p: Process, _ sig: Int32 = SIGTERM) -> [Int32] {
         func kids(_ pid: Int32) -> [Int32] {
             let q = Process(); q.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); q.arguments = ["-P", String(pid)]
             let pipe = Pipe(); q.standardOutput = pipe; q.standardError = FileHandle.nullDevice
@@ -515,8 +516,9 @@ final class Workspace {
         }
         var all: [Int32] = [], queue = [p.processIdentifier]
         while let pid = queue.popLast(), all.count < 500 { let k = kids(pid); all += k; queue += k }
-        for pid in all.reversed() { kill(pid, SIGTERM) }
-        p.terminate()
+        for pid in all.reversed() { kill(pid, sig) }
+        if sig == SIGTERM { p.terminate() } else if p.isRunning { kill(p.processIdentifier, sig) }
+        return all
     }
 
     /// Выход из приложения — фоновые команды не оставляем
@@ -690,9 +692,14 @@ final class Workspace {
         for job in jobs.values where job.p.isRunning && inside(job.root) { job.stopped = true; procs.append(job.p) }
         for p in running.values where p.isRunning && inside(p.currentDirectoryURL?.path ?? "") { procs.append(p) }
         lock.unlock()
-        for p in procs { stopTree(p) }   // иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+        var pids: [Int32] = []
+        for p in procs { pids += stopTree(p) }   // иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+        let alive = { (pid: Int32) -> Bool in kill(pid, 0) == 0 }
         let until = Date().addingTimeInterval(3)
-        while procs.contains(where: { $0.isRunning }) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
+        while (procs.contains(where: { $0.isRunning }) || pids.contains(where: alive)) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
+        // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко
+        for p in procs where p.isRunning { stopTree(p, SIGKILL) }
+        for pid in pids where alive(pid) { kill(pid, SIGKILL) }
         foldersLock.lock()
         allowed = allowed.filter { $0 != base && !$0.hasPrefix(base + "/") }
         foldersLock.unlock()

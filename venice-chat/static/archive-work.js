@@ -3,7 +3,7 @@
 "use strict";
 const AW = (() => {
   const MB = 1 << 20;
-  const LIMITS = { zip: 100 * MB, entries: 65_000, files: 10_000, bytes: 300 * MB, file: 50 * MB };
+  const LIMITS = { zip: 100 * MB, entries: 65_000, files: 10_000, bytes: 300 * MB, file: 50 * MB, path: 800 };
   const utf8 = new TextDecoder("utf-8", { fatal: true });
   let cp866 = null; try { cp866 = new TextDecoder("ibm866"); } catch {}
   // имена без флага UTF-8: архивы с Mac — в UTF-8, из Проводника Windows — в cp866
@@ -32,7 +32,7 @@ const AW = (() => {
   const sameBytes = (a, b) => { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; };
 
   function planUnpack(zip) {
-    const files = [], deps = new Set(), skipped = { links: 0, unsafe: 0, dup: 0, big: 0 };
+    const files = [], deps = new Set(), skipped = { links: 0, unsafe: 0, dup: 0, big: 0, long: 0 };
     const taken = new Map();   // путь в нижнем регистре → "f" | "d" (на Mac «A.txt» и «a.txt» — один файл)
     let entries = 0;
     for (const e of Object.values(zip.files)) {
@@ -61,14 +61,17 @@ const AW = (() => {
     const wrapName = tops.size === 1 && files.every(f => f.parts.length > 1) ? files[0].parts[0] : "";
     const out = files.map(f => ({ entry: f.entry, rel: f.parts.slice(wrapName ? 1 : 0).join("/").normalize("NFC"), size: f.size, x: f.x }))
       // сервер срезает пробелы по краям пути — такие файлы не распаковываем, в готовом архиве они останутся как были
-      .filter(f => !/^[\s\x1c-\x1f\x85]|[\s\x1c-\x1f\x85]$/.test(f.rel));
+      .filter(f => !/^[\s\x1c-\x1f\x85]|[\s\x1c-\x1f\x85]$/.test(f.rel))
+      // слишком длинный путь: на Mac весь путь к файлу — до 1024 байт, а копия лежит глубоко в папке данных
+      .filter(f => enc.encode(f.rel).length <= LIMITS.path || (skipped.long++, false));
     // почти весь код — в папке, которую обход папки пропускает (собранный сайт в dist/), а исходников рядом нет — подскажем модели
     const code = out.filter(f => CODE_FILE.test(f.rel)), per = {};
     for (const f of code) { const t = HIDDEN_BUILD.exec(f.rel)?.[1]; if (t && t !== "coverage" && t !== "target") per[t] = (per[t] || 0) + 1; }
-    const outside = code.filter(f => !HIDDEN_BUILD.test(f.rel) && !/\.(json|ya?ml|toml|ini|cfg|conf|xml|svg)$/i.test(f.rel)).length;
+    // снаружи — не больше пары файлов и только в корне (index.html, server.js); код в подпапке (src/) — это исходники
+    const outside = code.filter(f => !HIDDEN_BUILD.test(f.rel) && !/\.(json|ya?ml|toml|ini|cfg|conf|xml|svg)$/i.test(f.rel));
     const [codeDir = "", n = 0] = Object.entries(per).sort((a, b) => b[1] - a[1])[0] || [];
     return { files: out, prefix: wrapName ? wrapName + "/" : "", wrapName, entries, bytes: out.reduce((s, f) => s + f.size, 0),
-      deps: [...deps], skipped, codeDir: n > code.length / 2 && outside <= 2 ? codeDir : "" };
+      deps: [...deps], skipped, codeDir: n > code.length / 2 && outside.length <= 2 && !outside.some(f => f.rel.includes("/")) ? codeDir : "" };
   }
 
   // "" — можно править; иначе причина простыми словами
@@ -90,6 +93,7 @@ const AW = (() => {
     for (const name of Object.keys(zip.files)) {
       const e = zip.files[name];
       if (isUnsafe(e) || JUNK.test(rawName(e))) continue;
+      if (/\\$/.test(name)) e.dir = true;   // «X\» из PowerShell/.NET — папка, даже без пометки
       if (!e.dir && e._data?.compression?.magic === "\x00\x00") e.options.compression = "STORE";
       let n = slashed(name);
       if (n !== name && (n in files || n in zip.files)) n = name;
@@ -111,8 +115,10 @@ const AW = (() => {
     for (const k of was.keys()) { const a = k.split("/"); for (let i = 1; i < a.length; i++) snapDirs.add(a.slice(0, i).join("/")); }
     const report = { changed: [], added: [], deleted: [], skipped: [] };
     const gone = [];
-    // JSZip пишет время в архив по UTC-часам даты — сдвигаем, чтобы в архиве было местное время правки
-    const stamp = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000);
+    // время файла — когда его правили в копии (версия «<мкс>-<размер>»); JSZip пишет его по UTC-часам даты —
+    // сдвигаем, чтобы в архиве было местное время
+    const local = ms => new Date(ms - new Date(ms).getTimezoneOffset() * 60_000);
+    const editedAt = v => { const us = parseInt(v, 10); return local(us > 0 ? us / 1000 : Date.now()); };
     for (const [k, b] of was) {
       if (cur.has(k) || !b.entry || !zip.files[b.entry] || zip.files[b.entry].dir) continue;
       delete zip.files[b.entry]; gone.push(b.entry); report.deleted.push(k);
@@ -130,7 +136,7 @@ const AW = (() => {
       const data = await get(f.path);
       const old = b?.entry && zip.files[b.entry] && !zip.files[b.entry].dir ? zip.files[b.entry] : null;
       if (old && sameBytes(await old.async("uint8array"), data)) continue;   // правку отменили — файл как был
-      zip.file(old ? b.entry : snap.prefix + k, data, { date: stamp, createFolders: false,
+      zip.file(old ? b.entry : snap.prefix + k, data, { date: editedAt(f.version), createFolders: false,
         unixPermissions: old?.unixPermissions ?? (f.x ? 0o100755 : 0o100644) });
       report[old ? "changed" : "added"].push(k);
     }

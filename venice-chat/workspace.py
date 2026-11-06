@@ -96,12 +96,19 @@ class Workspace:
         inside = lambda p: p == base or p.startswith(base + "/")
         procs = []
         for job in list(self.jobs.values()):
-            if inside(job["root"]) and job["proc"].poll() is None:
+            # оболочка могла уже выйти, а запущенное ею (cmd &) ещё работает — его выдаёт живой поток чтения вывода
+            pump = job.get("pump")
+            if inside(job["root"]) and (job["proc"].poll() is None or (pump and pump.is_alive())):
                 job["stopped"] = True
                 procs.append(job["proc"])
-        procs += [proc for root, proc in list(self.running.values()) if inside(root) and proc.poll() is None]
+        procs += [proc for root, proc in list(self.running.values()) if inside(root)]   # команда в списке, пока не вернулась
         for proc in procs:   # иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
             self.stop_tree(proc)
+        for proc in procs:   # и то, что пережило оболочку или не слушает SIGTERM, — жёстко
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
         with self.folders_lock:
             items = self.allowed()
             keep = [p for p in items if p != base and not p.startswith(base + "/")]
@@ -484,7 +491,7 @@ class Workspace:
             shutil.copy2(d / "file", p)
         elif p.exists():
             p.unlink()
-        return {"ok": True, "path": meta["path"], "version": file_version(p) if p.is_file() else ""}
+        return {"ok": True, "path": meta["path"]}
 
     @staticmethod
     def shell_env():
@@ -514,7 +521,8 @@ class Workspace:
                 with job["lock"]:
                     if len(job["out"]) < 4_000_000:
                         job["out"] += chunk
-        threading.Thread(target=pump, daemon=True).start()
+        job["pump"] = threading.Thread(target=pump, daemon=True)
+        job["pump"].start()
         self.job_count += 1
         jid = f"job{self.job_count}"
         self.jobs[jid] = job
