@@ -2219,7 +2219,7 @@ async function runTool(call, chat, msg) {
   const done = (status, text, result) => { step.status = status; if (text) step.text = text; scheduleUpdate(chat, msg); return result; };
   const failed = r => r?.error || r?.loadError;
   // Venice испортил буквы внутри вызова — не выполняем (иначе «�» попадут в файл), просим повторить
-  if (BROKEN.test(JSON.stringify(args)) && brokenArgs(call.name, args, legitBroken(chat)) && (msg.brokenRetries = (msg.brokenRetries || 0) + 1) <= BROKEN_RETRIES)
+  if (BROKEN.test(JSON.stringify(args)) && brokenArgs(call.name, args, knownBroken(chat, msg)) && (msg.brokenRetries = (msg.brokenRetries || 0) + 1) <= BROKEN_RETRIES)
     return done("note", BROKEN_NOTE, { text: BROKEN_TEXT });
   if (call.name === "remember_user") {
     const ok = rememberUser(args.note);
@@ -2429,21 +2429,31 @@ async function streamRequest(body, controller) {
 // приложение коротким запросом просит модель восстановить только испорченные слова, а вызовы инструментов
 // с такими знаками (правки файлов, команды) не выполняет — модель повторяет их заново.
 const BROKEN = /\uFFFD/;
-const brokenCount = s => (String(s ?? "").match(/\uFFFD/g) || []).length;
 const BROKEN_RETRIES = 4;
 const BROKEN_NOTE = "Venice испортил буквы в этом действии — ИИ повторяет его заново";
 const BROKEN_TEXT = "[Проверка приложения] В аргументах вызова есть испорченные символы «�» — это сбой передачи текста у Venice, а не твоя ошибка. Ничего не выполнено. Повтори этот же вызов ещё раз, написав весь текст заново правильно.";
 // замены edit_file: списком edits или одной парой old/new (пустой edits — тоже одна пара)
 const editList = a => Array.isArray(a?.edits) && a.edits.length ? a.edits : [{ old: a?.old, new: a?.new, all: a?.all }];
-// настоящие «�» (файл когда-то сохранили не в той кодировке) есть у пользователя или в прочитанных файлах — это не сбой Venice
-const legitBroken = chat => (chat.messages || []).some(m => m.sawBroken || (m.role === "user" &&
-  (BROKEN.test(m.content || "") || (m.files || []).some(f => f.kind === "text" && BROKEN.test(f.data || "")))));
-function brokenArgs(name, a, legit = false) {
-  const badPath = !legit && BROKEN.test(String(a.path ?? ""));
-  if (name === "edit_file") return badPath || editList(a).some(e => brokenCount(e?.new) > brokenCount(e?.old));
-  if (name === "write_file") return badPath;   // текст файла сверяется с прежним в fsTool
-  if (legit && (READ_ONLY_TOOLS.has(name) || name.startsWith("archive_") || name === "run_command")) return false;
-  return BROKEN.test(JSON.stringify(a));
+// «�»-слова: буквы, цифры и «�» подряд
+const brokenWords = t => String(t ?? "").match(/[\p{L}\p{N}\uFFFD]*\uFFFD[\p{L}\p{N}\uFFFD]*/gu) || [];
+const BROKEN_SEEN = new WeakMap();   // ответ → «�»-слова из файлов и выводов команд, которые ИИ видел в этом ответе
+// Настоящие «�» (файл когда-то сохранили не в той кодировке) уже есть у пользователя, в его вложениях
+// или в прочитанных файлах — их можно искать и цитировать. Сбой Venice даёт новые слова с «�», которых там нет.
+function knownBroken(chat, msg) {
+  const known = new Set(BROKEN_SEEN.get(msg));
+  for (const m of chat.messages || []) {
+    for (const w of BROKEN_SEEN.get(m) || []) known.add(w);
+    if (m.role !== "user") continue;
+    for (const t of [m.content, ...(m.files || []).filter(f => f.kind === "text").map(f => f.data)]) for (const w of brokenWords(t)) known.add(w);
+  }
+  return known;
+}
+const SEES_FILES = name => READ_ONLY_TOOLS.has(name) || name.startsWith("archive_") || ["run_command", "command_status", "explore"].includes(name);
+function brokenArgs(name, a, known = new Set()) {
+  const fresh = (t, also = "") => brokenWords(t).some(w => !known.has(w) && !also.includes(w));
+  if (name === "edit_file") return fresh(a.path) || editList(a).some(e => fresh(e?.new, String(e?.old ?? "")));
+  if (name === "write_file") return fresh(a.path);   // текст файла сверяется с прежним в fsTool
+  return fresh(JSON.stringify(a));
 }
 // испорченное слово годится в замену, только если всё остальное в нём совпало, а вместо «�» стоят 1–2 символа
 function brokenFixOk(word, fix) {
@@ -2453,8 +2463,10 @@ function brokenFixOk(word, fix) {
 }
 async function repairBroken(chat, msg, controller) {
   const text = msg.content || "";
-  if (!BROKEN.test(text) || legitBroken(chat)) return null;   // «�» настоящие — ответ их и цитирует
-  const words = [...new Set(text.match(/\S*\uFFFD+\S*/g))].slice(0, 20);
+  if (!BROKEN.test(text)) return null;
+  const known = knownBroken(chat, msg);   // настоящие «�» ответ просто цитирует — их не трогаем
+  const words = [...new Set(text.match(/\S*\uFFFD+\S*/g))].filter(w => !brokenWords(w).every(x => known.has(x))).slice(0, 20);
+  if (!words.length) return null;
   const list = words.map((w, i) => {
     const at = text.indexOf(w);
     return `${i + 1}. ${w}\n   в тексте: …${text.slice(Math.max(0, at - 90), at)}⟦${w}⟧${text.slice(at + w.length, at + w.length + 90)}…`;
@@ -2679,7 +2691,8 @@ async function runAgent(chat) {
         if (controller.signal.aborted) throw new DOMException("stop", "AbortError");
         const result = parallel ? ready[k] : await runTool(call, chat, msg);
         add(result.usage);
-        if ((READ_ONLY_TOOLS.has(call.name) || call.name.startsWith("archive_")) && BROKEN.test(result.text || "")) msg.sawBroken = true;
+        if (SEES_FILES(call.name) && BROKEN.test(result.text || ""))
+          BROKEN_SEEN.set(msg, new Set([...(BROKEN_SEEN.get(msg) || []), ...brokenWords(result.text)]));
         // одно и то же в третий раз — напоминаем, что это уже было
         const sig = call.name + " " + (call.args || "").replace(/\s+/g, " ");
         const times = (seen.get(sig) || 0) + 1;
@@ -3076,9 +3089,14 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
         old = o.text.split("\n").map(l => l.replace(/^\d+\t/, "")).join("\n");
         oldPath = o.path;
       } catch {}
-      // «�» в тексте больше, чем было в файле, — Venice испортил буквы: не пишем, просим повторить
-      if (brokenCount(args.content) > brokenCount(old ?? "") && (msg.brokenRetries = (msg.brokenRetries || 0) + 1) <= BROKEN_RETRIES)
-        return { status: "note", label: BROKEN_NOTE, text: BROKEN_TEXT };
+      // в тексте новые слова с «�», которых не было ни в файле, ни у пользователя, — Venice испортил буквы: не пишем, просим повторить
+      if (BROKEN.test(String(args.content ?? "")) && (msg.brokenRetries || 0) < BROKEN_RETRIES) {
+        const known = knownBroken(chat, msg);
+        if (brokenWords(args.content).some(w => !known.has(w) && !(old ?? "").includes(w))) {
+          msg.brokenRetries = (msg.brokenRetries || 0) + 1;
+          return { status: "note", label: BROKEN_NOTE, text: BROKEN_TEXT };
+        }
+      }
       const seen = readsOf(chat).get(oldPath);
       if (old != null && !seen) return { status: "err", label: `Сначала нужно прочитать ${shortPath(oldPath)}`, text: `Запись не выполнена: файл ${oldPath} уже есть, а ты его не читал. Прочитай его через read_file и меняй через edit_file — иначе можно затереть чужие изменения.` };
       step.diff = diffLines(old ?? "", args.content);
