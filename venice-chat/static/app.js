@@ -2034,15 +2034,15 @@ async function revertDropped(chat, dropped) {
   }
   const of = dropped.filter(m => ran(m) || (m.steps || []).some(st => steps.includes(st))).length > 1 ? "убранных ответов" : "прошлого ответа";
   if (!steps.length) return toast(`То, что изменили команды ${of}, осталось в копии`, 5000);
-  if (!done && failed) return toast(`Не удалось отменить правки ${of}: файлы остались изменёнными`, 6000);
   const kept = new Set(steps.map(key).filter(k => steps.every(st => key(st) !== k || skip(st)))).size;
   const notes = [
     kept && (kept === 1 ? "файл, где вы уже отменили более раннюю правку, оставлен как есть" : "файлы, где вы уже отменили более ранние правки, оставлены как есть"),
-    failed && (failed === 1 ? "одну правку отменить не удалось" : `${plural(failed, "правку", "правки", "правок")} отменить не удалось`),
+    done && failed && (failed === 1 ? "одну правку отменить не удалось" : `${plural(failed, "правку", "правки", "правок")} отменить не удалось`),
     cmds && "то, что изменили команды, могло остаться в копии",   // в других файлах или до первой правки
   ].filter(Boolean);
-  if (!done) return toast(notes.join("; ").replace(/^./, c => c.toUpperCase()), 6000);   // всё оставлено как есть
-  toast(notes.length ? `Правки ${of} отменены, но ${notes.join("; ")}` : `Правки ${of} отменены — ИИ начнёт с тех же файлов`, notes.length ? 6000 : 2200);
+  if (done) toast(notes.length ? `Правки ${of} отменены, но ${notes.join("; ")}` : `Правки ${of} отменены — ИИ начнёт с тех же файлов`, notes.length ? 6000 : 2200);
+  else if (failed) toast(`Не удалось отменить правки ${of}` + (notes.length ? `; ${notes.join("; ")}` : ": файлы остались изменёнными"), 6000);
+  else toast(notes.join("; ").replace(/^./, c => c.toUpperCase()), 6000);   // всё оставлено как есть
 }
 function dropOrphanCopies(chat, dropped) {   // копии архивов из убранных сообщений больше не нужны
   for (const m of dropped) for (const f of m.files || []) if (f.archive?.work) fsApi("drop", { root: f.archive.work.base }).catch(() => {});
