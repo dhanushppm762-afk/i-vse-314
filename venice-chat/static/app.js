@@ -1932,10 +1932,6 @@ async function prepareWorkCopy(chat, msg, signal) {
     a = c.a; blob = b; break;
   }
   if (!a) { msg.steps.splice(msg.steps.indexOf(step), 1); scheduleUpdate(chat, msg); return; }
-  for (const c of cands) if (c.a !== a && !c.a.readOnly) {
-    c.a.readOnly = `править можно один архив за раз — сейчас это «${a.name}»`;
-    note(`Архив «${c.a.name}» ИИ только читает: ${c.a.readOnly}`);
-  }
   try {
     const made = await unpackArchive(chat, msg, a, blob, plan, zip, step, signal);
     a.work = { root: made.root, base: made.base, prefix: plan.prefix, deps: plan.deps, codeDir: plan.codeDir,
@@ -1949,6 +1945,11 @@ async function prepareWorkCopy(chat, msg, signal) {
       (plan.deps.length ? `; не распакованы ${plan.deps.join(", ")} — в готовом архиве они останутся как были` : "") +
       (nb ? `; ${plural(nb, "большой файл", "больших файла", "больших файлов")} (больше 50 МБ) ${one(nb) ? "не распакован — останется как был" : "не распакованы — останутся как были"}` : "") +
       (nl ? `; ${plural(nl, "файл", "файла", "файлов")} со слишком длинным путём ${one(nl) ? "не распакован — останется как был" : "не распакованы — останутся как были"}` : "");
+    // остальные архивы — только читаем (если распаковать не вышло, в следующий раз они снова в очереди)
+    for (const c of cands) if (c.a !== a && !c.a.readOnly) {
+      c.a.readOnly = `править можно один архив за раз — сейчас это «${a.name}»`;
+      note(`Архив «${c.a.name}» ИИ только читает: ${c.a.readOnly}`);
+    }
     persist(chat);
     if (S.chat === chat) { renderPending(); renderThread(); }   // пометка «ИИ правит копию» — уже на новом архиве
   } catch (e) {
