@@ -20,7 +20,7 @@ SKIP_DIRS = {"node_modules", ".git", ".svn", ".hg", "vendor", ".venv", "venv", "
              ".next", ".nuxt", ".pnpm-store", ".worktrees", "dist", "build", "out", "coverage", ".build", "target"}
 # Рабочие копии архивов: <данные>/work/<чат>/<метка>/<имя>
 WORK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-WORK_SKIP = {"node_modules", ".git", "__pycache__", ".venv", "venv"}   # должно быть подмножеством UNPACK_SKIP в archive-work.js
+WORK_SKIP = {"node_modules", ".git", "__pycache__", ".venv", "venv", "Pods", ".gradle", "DerivedData", "jspm_packages"}   # должно быть подмножеством UNPACK_SKIP в archive-work.js
 WORK_MAX_FILES = 100_000
 NOT_WORK = "Это можно только в рабочей копии архива"
 MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "README.md"]
@@ -92,7 +92,16 @@ class Workspace:
         return p
 
     def forget_tree(self, base):
-        """Копия архива больше не нужна: убрать её папки из разрешённых и стереть с диска."""
+        """Копия архива больше не нужна: остановить запущенное в ней, убрать её папки из разрешённых и стереть с диска."""
+        inside = lambda p: p == base or p.startswith(base + "/")
+        procs = []
+        for job in list(self.jobs.values()):
+            if inside(job["root"]) and job["proc"].poll() is None:
+                job["stopped"] = True
+                procs.append(job["proc"])
+        procs += [proc for root, proc in list(self.running.values()) if inside(root) and proc.poll() is None]
+        for proc in procs:   # иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+            self.stop_tree(proc)
         with self.folders_lock:
             items = self.allowed()
             keep = [p for p in items if p != base and not p.startswith(base + "/")]
@@ -172,6 +181,9 @@ class Workspace:
         if not WORK_ID.fullmatch(str(chat_id or "")):
             return
         d = self.work_dir / chat_id
+        if d.is_symlink():   # ссылку убираем, а не то, куда она ведёт
+            d.unlink()
+            return
         if d.is_dir():
             self.forget_tree(str(d.resolve()))
 
@@ -472,7 +484,7 @@ class Workspace:
             shutil.copy2(d / "file", p)
         elif p.exists():
             p.unlink()
-        return {"ok": True, "path": meta["path"]}
+        return {"ok": True, "path": meta["path"], "version": file_version(p) if p.is_file() else ""}
 
     @staticmethod
     def shell_env():
@@ -563,6 +575,7 @@ class Workspace:
         # своя группа процессов: по таймауту останавливаем и всё, что команда запустила
         proc = subprocess.Popen([shell, "-lc", cmd], cwd=r, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        self.running[id(proc)] = (str(r), proc)   # чтобы удаление копии архива могло её остановить
         try:
             data, _ = proc.communicate(timeout=timeout)
             code = proc.returncode
@@ -573,6 +586,8 @@ class Workspace:
                 data, _ = proc.communicate(timeout=3)
             except subprocess.TimeoutExpired:
                 data = b""
+        finally:
+            self.running.pop(id(proc), None)
         text = (data or b"").decode("utf-8", errors="replace")
         if len(text) > MAX_OUTPUT:
             text = text[:MAX_OUTPUT // 3] + f"\n…[вывод сокращён: {len(text)} символов]…\n" + text[-MAX_OUTPUT * 2 // 3:]

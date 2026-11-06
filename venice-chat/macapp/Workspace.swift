@@ -24,7 +24,7 @@ final class Workspace {
     private var memoryDir: URL { dataDir.appendingPathComponent("memory", isDirectory: true) }
     private var workDir: URL { dataDir.appendingPathComponent("work", isDirectory: true) }
     private let foldersLock = NSLock()
-    static let workSkip: Set<String> = ["node_modules", ".git", "__pycache__", ".venv", "venv"]   // ⊆ UNPACK_SKIP в archive-work.js
+    static let workSkip: Set<String> = ["node_modules", ".git", "__pycache__", ".venv", "venv", "Pods", ".gradle", "DerivedData", "jspm_packages"]   // ⊆ UNPACK_SKIP в archive-work.js
     private static let notWork = "Это можно только в рабочей копии архива"
 
     // MARK: разрешённые папки
@@ -391,7 +391,7 @@ final class Workspace {
         } else {
             try? FileManager.default.removeItem(at: url)
         }
-        return ["ok": true, "path": meta["path"] as? String ?? ""]
+        return ["ok": true, "path": meta["path"] as? String ?? "", "version": version(url) ?? ""]
     }
 
     private func run(_ r: URL, _ body: [String: Any], id: ObjectIdentifier) throws -> [String: Any] {
@@ -674,12 +674,25 @@ final class Workspace {
     func dropChatWork(_ chat: String) {
         guard chat.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else { return }
         let dir = workDir.appendingPathComponent(chat, isDirectory: true)
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: dir.path)) != nil {
+            try? FileManager.default.removeItem(atPath: dir.path)   // ссылку убираем, а не то, куда она ведёт
+            return
+        }
         guard FileManager.default.fileExists(atPath: dir.path) else { return }
         forgetTree(dir.resolvingSymlinksInPath().path)
     }
 
-    /// Убрать копию (и всё внутри) из разрешённых и стереть с диска
+    /// Остановить запущенное в копии, убрать её (и всё внутри) из разрешённых и стереть с диска
     private func forgetTree(_ base: String) {
+        let inside = { (p: String) -> Bool in p == base || p.hasPrefix(base + "/") }
+        var procs: [Process] = []
+        lock.lock()
+        for job in jobs.values where job.p.isRunning && inside(job.root) { job.stopped = true; procs.append(job.p) }
+        for p in running.values where p.isRunning && inside(p.currentDirectoryURL?.path ?? "") { procs.append(p) }
+        lock.unlock()
+        for p in procs { stopTree(p) }   // иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+        let until = Date().addingTimeInterval(3)
+        while procs.contains(where: { $0.isRunning }) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
         foldersLock.lock()
         allowed = allowed.filter { $0 != base && !$0.hasPrefix(base + "/") }
         foldersLock.unlock()

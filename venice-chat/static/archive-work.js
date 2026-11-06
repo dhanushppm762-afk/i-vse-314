@@ -22,6 +22,11 @@ const AW = (() => {
 
   // «./a» и «a//b» безопасны (JSZip их просто нормализует); «../», «/abs», «C:\», NUL и слишком длинные имена — нет
   const rawName = e => (e.unsafeOriginalName ?? e.name).replace(/\\/g, "/");
+  // архивы из PowerShell/.NET пишут пути через «\» — в готовом архиве они станут обычными «/»
+  const slashed = n => n.replace(/\\/g, "/").replace(/\/\/+$/, "/");
+  const num = n => n.toLocaleString("ru-RU");
+  const filesN = n => { const m10 = n % 10, m100 = n % 100;
+    return `${num(n)} ${m10 === 1 && m100 !== 11 ? "файл" : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? "файла" : "файлов"}`; };
   const isUnsafe = e => { const raw = rawName(e); return /^(\/|[A-Za-z]:)/.test(raw) || raw.split("/").some(s => s === ".." || s.includes("\0") || enc.encode(s).length > 255); };
   const isLink = e => ((e.unixPermissions || 0) & 0o170000) === 0o120000;
   const sameBytes = (a, b) => { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; };
@@ -32,7 +37,7 @@ const AW = (() => {
     let entries = 0;
     for (const e of Object.values(zip.files)) {
       entries++;
-      if (e.dir) continue;
+      if (e.dir || /\\$/.test(e.name)) continue;
       if (isUnsafe(e)) { skipped.unsafe++; continue; }
       const parts = e.name.replace(/\\/g, "/").split("/").filter(s => s && s !== ".");
       if (!parts.length) continue;
@@ -54,34 +59,44 @@ const AW = (() => {
     // всё лежит в одной общей папке (Finder «site/», GitHub «repo-main/») — в копии её нет, в готовом архиве она вернётся
     const tops = new Set(files.map(f => f.parts[0]));
     const wrapName = tops.size === 1 && files.every(f => f.parts.length > 1) ? files[0].parts[0] : "";
-    const out = files.map(f => ({ entry: f.entry, rel: f.parts.slice(wrapName ? 1 : 0).join("/").normalize("NFC"), size: f.size, x: f.x }));
-    // большая часть кода — в папке, которую обход папки пропускает (собранный сайт в dist/) — подскажем модели
+    const out = files.map(f => ({ entry: f.entry, rel: f.parts.slice(wrapName ? 1 : 0).join("/").normalize("NFC"), size: f.size, x: f.x }))
+      // сервер срезает пробелы по краям пути — такие файлы не распаковываем, в готовом архиве они останутся как были
+      .filter(f => !/^[\s\x1c-\x1f\x85]|[\s\x1c-\x1f\x85]$/.test(f.rel));
+    // почти весь код — в папке, которую обход папки пропускает (собранный сайт в dist/), а исходников рядом нет — подскажем модели
     const code = out.filter(f => CODE_FILE.test(f.rel)), per = {};
-    for (const f of code) { const t = HIDDEN_BUILD.exec(f.rel)?.[1]; if (t) per[t] = (per[t] || 0) + 1; }
+    for (const f of code) { const t = HIDDEN_BUILD.exec(f.rel)?.[1]; if (t && t !== "coverage" && t !== "target") per[t] = (per[t] || 0) + 1; }
+    const outside = code.filter(f => !HIDDEN_BUILD.test(f.rel) && !/\.(json|ya?ml|toml|ini|cfg|conf|xml|svg)$/i.test(f.rel)).length;
     const [codeDir = "", n = 0] = Object.entries(per).sort((a, b) => b[1] - a[1])[0] || [];
     return { files: out, prefix: wrapName ? wrapName + "/" : "", wrapName, entries, bytes: out.reduce((s, f) => s + f.size, 0),
-      deps: [...deps], skipped, codeDir: n > code.length / 2 ? codeDir : "" };
+      deps: [...deps], skipped, codeDir: n > code.length / 2 && outside <= 2 ? codeDir : "" };
   }
 
   // "" — можно править; иначе причина простыми словами
   function checkLimits(plan, zipSize) {
-    const mb = n => Math.max(1, Math.round(n / MB)), num = n => n.toLocaleString("ru-RU");
+    const mb = n => Math.max(1, Math.round(n / MB));
     if (zipSize > LIMITS.zip) return `архив ${mb(zipSize)} МБ — править можно до ${mb(LIMITS.zip)} МБ`;
     if (plan.entries > LIMITS.entries) return `в нём больше ${num(LIMITS.entries)} записей`;
     if (plan.files.length > LIMITS.files || plan.bytes > LIMITS.bytes)
-      return `слишком большой: ${num(plan.files.length)} файлов, ${mb(plan.bytes)} МБ (можно до ${num(LIMITS.files)} файлов и ${mb(LIMITS.bytes)} МБ)`;
+      return `слишком большой: ${filesN(plan.files.length)}, ${mb(plan.bytes)} МБ (можно до ${num(LIMITS.files)} файлов и ${mb(LIMITS.bytes)} МБ)`;
     if (!plan.files.length) return "в архиве нет файлов, которые можно править";
     return "";
   }
 
   // Перед сборкой: мусор и опасные пути — вон (точечно, без zip.remove: тот на папке удаляет всё содержимое);
-  // файлы, лежавшие без сжатия, так и остаются — их байты копируются как есть
+  // файлы, лежавшие без сжатия, так и остаются — их байты копируются как есть.
+  // Имена в готовом архиве JSZip берёт из ключей zip.files — поэтому «\» меняем в ключах
   function prepareOutput(zip) {
+    const files = Object.create(null);
     for (const name of Object.keys(zip.files)) {
       const e = zip.files[name];
-      if (isUnsafe(e) || JUNK.test(rawName(e))) { delete zip.files[name]; continue; }
+      if (isUnsafe(e) || JUNK.test(rawName(e))) continue;
       if (!e.dir && e._data?.compression?.magic === "\x00\x00") e.options.compression = "STORE";
+      let n = slashed(name);
+      if (n !== name && (n in files || n in zip.files)) n = name;
+      e.name = n;
+      files[n] = e;
     }
+    zip.files = files;
   }
 
   // Готовый архив = исходный, где изменённые файлы заменены, новые добавлены, удалённые убраны.
@@ -89,12 +104,15 @@ const AW = (() => {
   // get(путь) → Uint8Array с байтами файла рабочей копии
   async function applyChanges(zip, { snap, now, get }) {
     const nfc = p => p.normalize("NFC");
-    const was = new Map(snap.files.map(([p, entry, v]) => [nfc(p), { entry, v }]));
+    const ent = n => n && (zip.files[n] ? n : slashed(n));   // запись снимка — до prepareOutput, с «\»
+    const was = new Map(snap.files.map(([p, entry, v]) => [nfc(p), { entry: ent(entry), v }]));
     const cur = new Map(now.map(f => [nfc(f.path), f]));
     const snapDirs = new Set();
     for (const k of was.keys()) { const a = k.split("/"); for (let i = 1; i < a.length; i++) snapDirs.add(a.slice(0, i).join("/")); }
     const report = { changed: [], added: [], deleted: [], skipped: [] };
     const gone = [];
+    // JSZip пишет время в архив по UTC-часам даты — сдвигаем, чтобы в архиве было местное время правки
+    const stamp = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000);
     for (const [k, b] of was) {
       if (cur.has(k) || !b.entry || !zip.files[b.entry] || zip.files[b.entry].dir) continue;
       delete zip.files[b.entry]; gone.push(b.entry); report.deleted.push(k);
@@ -107,12 +125,12 @@ const AW = (() => {
       if (b && b.v === f.version) continue;   // не трогали
       if (!b) {
         const bd = BUILD_DIR.exec(k);
-        if (PACK_SKIP.test(k) || JUNK.test(k) || (bd && !snapDirs.has(bd[1])) || f.size > LIMITS.file) { report.skipped.push(k); continue; }
+        if (PACK_SKIP.test(k) || UNPACK_SKIP.test(k) || JUNK.test(k) || (bd && !snapDirs.has(bd[1])) || f.size > LIMITS.file) { report.skipped.push(k); continue; }
       }
       const data = await get(f.path);
       const old = b?.entry && zip.files[b.entry] && !zip.files[b.entry].dir ? zip.files[b.entry] : null;
       if (old && sameBytes(await old.async("uint8array"), data)) continue;   // правку отменили — файл как был
-      zip.file(old ? b.entry : snap.prefix + k, data, { date: new Date(), createFolders: false,
+      zip.file(old ? b.entry : snap.prefix + k, data, { date: stamp, createFolders: false,
         unixPermissions: old?.unixPermissions ?? (f.x ? 0o100755 : 0o100644) });
       report[old ? "changed" : "added"].push(k);
     }

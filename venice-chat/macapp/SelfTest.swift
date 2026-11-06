@@ -26,6 +26,7 @@ const out = { steps: (m.steps || []).map(s => s.status + ": " + s.text), plan: m
 // что попало бы в готовый архив (до удаления чата — вместе с ним стирается и копия)
 const wa = activeArchive(S.chat);
 if (wa) { try { out.pack = (await packWork(wa.work.base, wa.work.root)).report; } catch (e) { out.pack = "ошибка: " + e.message; } }
+for (const f of S.chat.messages.flatMap(m => m.files || [])) if (f.archive?.work) await fsApi("drop", { root: f.archive.work.base }).catch(() => {});
 S.chat.deleted = true; await new Promise(r => setTimeout(r, 800)); await api.remove(S.chat.id); S.chats = S.chats.filter(c => c.id !== S.chat.id);
 S.settings.browserTool = before; saveSettings();
 return JSON.stringify(out);
