@@ -2,6 +2,7 @@
 
 Модель видит только папки, которые пользователь сам выбрал. При изменениях правь оба файла.
 """
+import base64
 import fnmatch
 import json
 import os
@@ -17,6 +18,11 @@ from pathlib import Path
 SKIP_DIRS = {"node_modules", ".git", ".svn", ".hg", "vendor", ".venv", "venv", "__pycache__", ".pytest_cache",
              ".mypy_cache", ".parcel-cache", ".turbo", ".cache", ".idea", ".vscode", ".gradle", "Pods", "DerivedData",
              ".next", ".nuxt", ".pnpm-store", ".worktrees", "dist", "build", "out", "coverage", ".build", "target"}
+# Рабочие копии архивов: <данные>/work/<чат>/<метка>/<имя>
+WORK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+WORK_SKIP = {"node_modules", ".git", "__pycache__", ".venv", "venv"}   # должно быть подмножеством UNPACK_SKIP в archive-work.js
+WORK_MAX_FILES = 100_000
+NOT_WORK = "Это можно только в рабочей копии архива"
 MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "README.md"]
 MAX_FILE_BYTES = 2 * 1024 * 1024
 # Карта кода: шаблоны объявлений (имя — в группе n); те же, что в Workspace.swift
@@ -58,6 +64,8 @@ class Workspace:
         self.folders = data_dir / "folders.json"
         self.backups = data_dir / "backups"
         self.memory_dir = data_dir / "memory"
+        self.work_dir = data_dir / "work"
+        self.folders_lock = threading.Lock()
         self.running = {}
         self.jobs = {}
         self.job_count = 0
@@ -69,13 +77,103 @@ class Workspace:
         except Exception:
             return []
 
+    def save_folders(self, items):
+        self.data.mkdir(parents=True, exist_ok=True)
+        tmp = self.folders.with_name(f".folders-{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(sorted(set(items))))
+        os.replace(tmp, self.folders)
+
     def allow(self, path):
         p = str(Path(path).expanduser().resolve())
-        items = self.allowed()
-        self.data.mkdir(parents=True, exist_ok=True)
-        if p not in items:
-            self.folders.write_text(json.dumps(sorted(set(items + [p]))))
+        with self.folders_lock:
+            items = self.allowed()
+            if p not in items:
+                self.save_folders(items + [p])
         return p
+
+    def forget_tree(self, base):
+        """Копия архива больше не нужна: убрать её папки из разрешённых и стереть с диска."""
+        with self.folders_lock:
+            items = self.allowed()
+            keep = [p for p in items if p != base and not p.startswith(base + "/")]
+            if len(keep) != len(items):
+                self.save_folders(keep)
+        shutil.rmtree(base, ignore_errors=True)
+
+    # ---- рабочие копии архивов ----
+    def work_base(self, r):
+        work = self.work_dir.resolve()
+        try:
+            parts = r.relative_to(work).parts
+        except ValueError:
+            parts = ()
+        if len(parts) < 2:
+            raise FsError(NOT_WORK)
+        return work / parts[0] / parts[1]
+
+    def work_new(self, body):
+        chat = str(body.get("chat") or "")
+        if not WORK_ID.fullmatch(chat):
+            raise FsError("Неверный id чата")
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(body.get("name") or "")).strip(".-")[:60] or "archive"
+        base = self.work_dir / chat / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+        (base / name).mkdir(parents=True)
+        return {"base": self.allow(base), "root": self.allow(base / name)}
+
+    def put_files(self, r, body):
+        self.work_base(r)
+        files = body.get("files") or []
+        for f in files:
+            rel = str(f.get("path") or "")
+            p = self.resolve(r, rel)
+            if p == r or p.is_symlink() or p.is_dir():
+                raise FsError(f"Нельзя записать {rel}")
+            try:
+                data = base64.b64decode(str(f.get("data") or ""), validate=True)
+            except ValueError:
+                raise FsError("Повреждённые данные файла")
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "ab" if f.get("append") else "wb") as out:
+                    out.write(data)
+                os.chmod(p, 0o755 if f.get("x") else 0o644)
+            except OSError as e:
+                raise FsError(f"Не удалось записать {rel}: {e.strerror}")
+        return {"written": len(files)}
+
+    def list_all(self, r, body):
+        self.work_base(r)
+        out = []
+        for dirpath, dirnames, filenames in os.walk(r):
+            dirnames[:] = [n for n in dirnames if n not in WORK_SKIP]
+            for n in filenames:
+                p = Path(dirpath) / n
+                if p.is_symlink() or not p.is_file():
+                    continue
+                st = p.stat()
+                out.append({"path": str(p.relative_to(r)), "size": st.st_size, "version": file_version(p), "x": bool(st.st_mode & 0o111)})
+                if len(out) > WORK_MAX_FILES:
+                    raise FsError("В рабочей папке больше 100 000 файлов — собрать архив нельзя")
+        return {"files": out}
+
+    def get_file(self, r, body):
+        self.work_base(r)
+        p = self.resolve(r, body.get("path"))
+        if p.is_symlink() or not p.is_file():
+            raise FsError(f"Файла {body.get('path')} нет")
+        return p.read_bytes()
+
+    def drop(self, r, body):
+        self.forget_tree(str(self.work_base(r)))
+        return {"ok": True}
+
+    def drop_work(self, chat_id):
+        """Чат удалён — стираем его рабочие копии архивов."""
+        if not WORK_ID.fullmatch(str(chat_id or "")):
+            return
+        d = self.work_dir / chat_id
+        if d.is_dir():
+            self.forget_tree(str(d.resolve()))
 
     def root(self, body):
         r = str(body.get("root") or "")
@@ -171,8 +269,10 @@ class Workspace:
                 raise FsError(f"Папки {path} нет")
             full = self.allow(p)
             return {"path": full, "name": Path(full).name}
+        if op == "work":
+            return self.work_new(body)
         r = self.root(body)
-        fn = {"info": self.info, "list": self.list, "grep": self.grep, "read": self.read, "write": self.write,
+        fn = {"put": self.put_files, "files": self.list_all, "get": self.get_file, "drop": self.drop, "info": self.info, "list": self.list, "grep": self.grep, "read": self.read, "write": self.write,
               "edit": self.edit, "undo": self.undo, "run": self.run, "memory": self.memory,
               "symbols": self.symbols, "job": self.job}.get(op)
         if op == "run" and body.get("background"):

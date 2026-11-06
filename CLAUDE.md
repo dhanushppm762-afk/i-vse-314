@@ -7,6 +7,7 @@
 - Маршруты `/api/*` есть в двух местах: `venice-chat/macapp/Backend.swift` и `venice-chat/server.py` — меняй оба.
   Папка проекта (`/api/fs/*`) — `macapp/Workspace.swift` и `venice-chat/workspace.py`.
   Папка принадлежит проекту (`project.folder`), не чату; поиск в интернете — инструмент `web_search`.
+  Правка архивов — `static/archive-work.js` + `/api/fs/work|put|files|get|drop` (в обоих бэкендах).
 - Сборка и `.dmg`: `./venice-chat/macapp/build.sh` (сначала `osascript -e 'quit app "И ВСЕ 3,14здец"'`).
 - Самотест: `VENICE_SELFTEST=1 "$HOME/Applications/И ВСЕ 3,14здец.app/Contents/MacOS/VeniceChat"`;
   агент: добавь `VENICE_AGENTTEST="задание"`.

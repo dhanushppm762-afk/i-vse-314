@@ -272,7 +272,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // VENICE_AGENTTEST_FOLDER=путь — модель работает с этой папкой (правки и команды разрешаются автоматически)
         var folder = env["VENICE_AGENTTEST_FOLDER"] ?? ""
         if !folder.isEmpty { folder = URL(fileURLWithPath: folder).resolvingSymlinksInPath().path; Workspace.shared.allow(folder) }
-        chatView.callAsyncJavaScript(SelfTest.agentScript, arguments: ["task": task, "deny": env["VENICE_AGENTTEST_DENY"] == "1", "folder": folder],
+        // VENICE_AGENTTEST_ZIP=путь к .zip — архив прикладывается к заданию (ИИ правит его копию)
+        var zipB64 = "", zipTitle = ""
+        if let z = env["VENICE_AGENTTEST_ZIP"], !z.isEmpty {
+            let url = URL(fileURLWithPath: (z as NSString).expandingTildeInPath)
+            if let data = try? Data(contentsOf: url) { zipB64 = data.base64EncodedString(); zipTitle = url.lastPathComponent }
+        }
+        chatView.callAsyncJavaScript(SelfTest.agentScript, arguments: ["task": task, "deny": env["VENICE_AGENTTEST_DENY"] == "1", "folder": folder,
+                                                                       "zipB64": zipB64, "zipTitle": zipTitle],
                                      in: nil, in: .page) { [weak self] in
             if !folder.isEmpty { Workspace.shared.forget(folder) }
             self?.finish($0)

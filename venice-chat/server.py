@@ -392,7 +392,8 @@ class Handler(BaseHTTPRequestHandler):
                 or "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.error(403, "Запрещено")
         try:
-            return self.send(200, WORKSPACE.handle(op, self.json_body() or {}))
+            res = WORKSPACE.handle(op, self.json_body() or {})
+            return self.send(200, res, "application/octet-stream") if isinstance(res, bytes) else self.send(200, res)
         except FsError as e:
             return self.error(400, str(e))
 
@@ -433,6 +434,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True})
         if method == "DELETE":
             f.unlink(missing_ok=True)
+            if folder == "chats":
+                WORKSPACE.drop_work(item_id)
             return self.send(200, {"ok": True})
         self.error(405, "Метод не поддерживается")
 

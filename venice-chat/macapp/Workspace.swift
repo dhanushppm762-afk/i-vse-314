@@ -22,6 +22,10 @@ final class Workspace {
     private var foldersURL: URL { dataDir.appendingPathComponent("folders.json") }
     private var backupsDir: URL { dataDir.appendingPathComponent("backups", isDirectory: true) }
     private var memoryDir: URL { dataDir.appendingPathComponent("memory", isDirectory: true) }
+    private var workDir: URL { dataDir.appendingPathComponent("work", isDirectory: true) }
+    private let foldersLock = NSLock()
+    static let workSkip: Set<String> = ["node_modules", ".git", "__pycache__", ".venv", "venv"]   // ⊆ UNPACK_SKIP в archive-work.js
+    private static let notWork = "Это можно только в рабочей копии архива"
 
     // MARK: разрешённые папки
 
@@ -34,12 +38,15 @@ final class Workspace {
 
     func allow(_ path: String) {
         let p = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        foldersLock.lock(); defer { foldersLock.unlock() }
         if !allowed.contains(p) { allowed += [p] }
     }
 
     // для самотестов: убрать временную папку из разрешённых и стереть заметки о ней
     func forget(_ path: String) {
+        foldersLock.lock()
         allowed = allowed.filter { $0 != path }
+        foldersLock.unlock()
         try? FileManager.default.removeItem(at: memoryURL(URL(fileURLWithPath: path)))
     }
 
@@ -83,7 +90,9 @@ final class Workspace {
         let id = ObjectIdentifier(t)
         queue.async { [self] in
             do {
+                if op == "work" { let made = try makeWork(body); b.json(t, 200, made); return }
                 let r = try root(body)
+                if op == "get" { let data = try getFile(r, body); b.respond(t, 200, data, type: "application/octet-stream"); return }
                 let out: [String: Any]
                 switch op {
                 case "info": out = info(r)
@@ -97,6 +106,9 @@ final class Workspace {
                 case "job": out = try jobStatus(r, body)
                 case "memory": out = memory(r, body)
                 case "symbols": out = try symbols(r, body)
+                case "put": out = try putFiles(r, body)
+                case "files": out = try listAll(r)
+                case "drop": out = try dropWork(r)
                 default: throw FsError("Нет такой операции: \(op)")
                 }
                 b.json(t, 200, out)
@@ -567,6 +579,111 @@ final class Workspace {
             return true
         }
         return ["map": lines.joined(separator: "\n"), "files": files, "truncated": truncated]
+    }
+
+    // MARK: рабочие копии архивов (/api/fs/work|put|files|get|drop) — те же операции в workspace.py
+
+    /// Папка одной копии: <данные>/work/<чат>/<метка>. Новые операции работают только внутри неё
+    private func workBase(_ r: URL) throws -> String {
+        let work = workDir.resolvingSymlinksInPath().path + "/"
+        guard r.path.hasPrefix(work) else { throw FsError(Self.notWork) }
+        let rest = r.path.dropFirst(work.count).split(separator: "/")
+        guard rest.count >= 2 else { throw FsError(Self.notWork) }
+        return work + String(rest[0]) + "/" + String(rest[1])
+    }
+
+    /// Новая рабочая копия: <данные>/work/<чат>/<время-случайное>/<имя латиницей>
+    private func makeWork(_ body: [String: Any]) throws -> [String: Any] {
+        let chat = body["chat"] as? String ?? ""
+        guard chat.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else { throw FsError("Неверный id чата") }
+        var name = (body["name"] as? String ?? "").replacingOccurrences(of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
+        name = String(name.trimmingCharacters(in: CharacterSet(charactersIn: ".-")).prefix(60))
+        if name.isEmpty { name = "archive" }
+        let stamp = "\(Int64(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(6).lowercased())"
+        let base = workDir.appendingPathComponent(chat, isDirectory: true).appendingPathComponent(stamp, isDirectory: true)
+        let root = base.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        allow(base.path)
+        allow(root.path)
+        return ["base": base.resolvingSymlinksInPath().path, "root": root.resolvingSymlinksInPath().path]
+    }
+
+    /// Запись файлов в копию: data — base64; append — дописать в конец (большие файлы идут частями)
+    private func putFiles(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
+        _ = try workBase(r)
+        let files = body["files"] as? [[String: Any]] ?? []
+        for f in files {
+            let path = f["path"] as? String ?? ""
+            let url = try resolve(r, path)
+            let v = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard url.path != r.path, v?.isDirectory != true, v?.isSymbolicLink != true else { throw FsError("Нельзя записать \(path)") }
+            guard let data = Data(base64Encoded: f["data"] as? String ?? "") else { throw FsError("Повреждённые данные файла") }
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if f["append"] as? Bool == true, FileManager.default.fileExists(atPath: url.path) {
+                let h = try FileHandle(forWritingTo: url)
+                defer { try? h.close() }
+                _ = try h.seekToEnd()
+                try h.write(contentsOf: data)
+            } else {
+                try data.write(to: url)
+            }
+            let mode = f["x"] as? Bool == true ? 0o755 : 0o644
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        }
+        return ["written": files.count]
+    }
+
+    /// Все файлы копии с версиями — по ним приложение понимает, что изменилось. Без папок зависимостей и ссылок
+    private func listAll(_ r: URL) throws -> [String: Any] {
+        _ = try workBase(r)
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        // без .skipsPackageDescendants и со скрытыми файлами: иначе файлы из App.xcodeproj или .htaccess сочтутся удалёнными
+        guard let en = FileManager.default.enumerator(at: r, includingPropertiesForKeys: keys, options: []) else { return ["files": [[String: Any]]()] }
+        var out: [[String: Any]] = []
+        for case let url as URL in en {
+            let v = try? url.resourceValues(forKeys: Set(keys))
+            if v?.isSymbolicLink == true { continue }
+            if v?.isDirectory == true {
+                if Self.workSkip.contains(url.lastPathComponent) { en.skipDescendants() }
+                continue
+            }
+            guard v?.isRegularFile == true, let a = try? FileManager.default.attributesOfItem(atPath: url.path) else { continue }
+            let perm = (a[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            out.append(["path": rel(r, url), "size": (a[.size] as? NSNumber)?.intValue ?? 0, "version": version(url) ?? "", "x": (perm & 0o111) != 0])
+            if out.count > 100_000 { throw FsError("В рабочей папке больше 100 000 файлов — собрать архив нельзя") }
+        }
+        return ["files": out]
+    }
+
+    private func getFile(_ r: URL, _ body: [String: Any]) throws -> Data {
+        _ = try workBase(r)
+        let path = body["path"] as? String ?? ""
+        let url = try resolve(r, path)
+        let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard v?.isRegularFile == true, v?.isSymbolicLink != true else { throw FsError("Файла \(path) нет") }
+        return try Data(contentsOf: url)
+    }
+
+    private func dropWork(_ r: URL) throws -> [String: Any] {
+        let base = try workBase(r)
+        forgetTree(base)
+        return ["ok": true]
+    }
+
+    /// Чат удалён — стираем его рабочие копии (вызывает Backend при DELETE /api/chats/<id>)
+    func dropChatWork(_ chat: String) {
+        guard chat.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else { return }
+        let dir = workDir.appendingPathComponent(chat, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: dir.path) else { return }
+        forgetTree(dir.resolvingSymlinksInPath().path)
+    }
+
+    /// Убрать копию (и всё внутри) из разрешённых и стереть с диска
+    private func forgetTree(_ base: String) {
+        foldersLock.lock()
+        allowed = allowed.filter { $0 != base && !$0.hasPrefix(base + "/") }
+        foldersLock.unlock()
+        try? FileManager.default.removeItem(atPath: base)
     }
 
     // Заметки модели о проекте — хранятся у приложения, в папку пользователя не пишутся

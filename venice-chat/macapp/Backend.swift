@@ -509,6 +509,7 @@ final class Backend: NSObject, WKURLSchemeHandler, URLSessionDataDelegate {
             catch { fail(t, 500, "Не удалось сохранить: \(error.localizedDescription)") }
         case "DELETE":
             try? FileManager.default.removeItem(at: file)
+            if folder == "chats" { DispatchQueue.global(qos: .utility).async { Workspace.shared.dropChatWork(id) } }   // и рабочие копии архивов этого чата
             json(t, 200, ["ok": true])
         default:
             fail(t, 405, "Метод не поддерживается")
