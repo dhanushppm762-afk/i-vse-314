@@ -406,8 +406,9 @@ final class Workspace {
         if meta["existed"] as? Bool == true {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent("file")) else { throw FsError("Копия для отмены не найдена") }
             do {
-                // папку файла могла переместить или стереть команда; ссылку на месте файла запись заменяет, а не пишет по ней
+                // папку файла могла переместить или стереть команда; ссылку на месте файла убираем — пишем не туда, куда она ведёт
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if link { try FileManager.default.removeItem(at: url) }
                 try data.write(to: url, options: .atomic)
             } catch { throw FsError("Не удалось вернуть \(path): \(Self.writeWhy(error))") }
         } else if link || FileManager.default.fileExists(atPath: url.path) {
@@ -723,12 +724,13 @@ final class Workspace {
         return ["files": out]
     }
 
+    /// Байты файла: из копии архива — для готового архива, из любой папки — для сверки «�» в целом файле
     private func getFile(_ r: URL, _ body: [String: Any]) throws -> Data {
-        _ = try workBase(r)
         let path = body["path"] as? String ?? ""
         let url = try resolve(r, path)
-        let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
         guard v?.isRegularFile == true, v?.isSymbolicLink != true else { throw FsError("Файла \(path) нет") }
+        if !isWork(r), (v?.fileSize ?? 0) > 16 * 1024 * 1024 { throw FsError("Файл слишком большой") }
         return try Data(contentsOf: url)
     }
 
@@ -779,9 +781,9 @@ final class Workspace {
             for pid in pids where alive(pid) { kill(pid, SIGKILL) }
             for pid in pidsIn(base) { kill(pid, SIGKILL) }
         }
-        workLock.lock()   // запись, которая уже шла, закончилась — теперь стираем
+        // доступ закрыт под workLock: запись, начатая раньше, уже закончилась, новая получит отказ — стираем без замка
+        // (иначе большая копия держала бы правки и удаление всех остальных чатов)
         try? FileManager.default.removeItem(atPath: base)
-        workLock.unlock()
     }
 
     // Заметки модели о проекте — хранятся у приложения, в папку пользователя не пишутся

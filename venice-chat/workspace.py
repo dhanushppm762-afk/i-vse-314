@@ -28,6 +28,7 @@ NOT_WORK = "Это можно только в рабочей копии архи
 GONE_WORK = "Рабочей копии архива больше нет"
 MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "README.md"]
 MAX_FILE_BYTES = 2 * 1024 * 1024
+GET_MAX_BYTES = 16 * 1024 * 1024   # /api/fs/get вне копии архива
 # Карта кода: шаблоны объявлений (имя — в группе n); те же, что в Workspace.swift
 SYMBOL_PATTERNS = [re.compile(p) for p in [
     r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?P<n>[\w$]+)",
@@ -114,8 +115,9 @@ class Workspace:
         for proc in procs:   # иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
             self.stop_tree(proc)
         self.stop_left(base)
-        with self.work_lock:   # запись, которая уже шла, закончилась — теперь стираем
-            shutil.rmtree(base, ignore_errors=True)
+        # доступ закрыт под work_lock: запись, начатая раньше, уже закончилась, новая получит отказ — стираем без замка
+        # (иначе большая копия держала бы правки и удаление всех остальных чатов)
+        shutil.rmtree(base, ignore_errors=True)
 
     # ---- рабочие копии архивов ----
     def work_base(self, r):
@@ -177,10 +179,12 @@ class Workspace:
         return {"files": out}
 
     def get_file(self, r, body):
-        self.work_base(r)
+        """Байты файла: из копии архива — для готового архива, из любой папки — для сверки «�» в целом файле."""
         p = self.resolve(r, body.get("path"))
         if p.is_symlink() or not p.is_file():
             raise FsError(f"Файла {body.get('path')} нет")
+        if self.work_dir.resolve() not in r.parents and p.stat().st_size > GET_MAX_BYTES:
+            raise FsError("Файл слишком большой")
         return p.read_bytes()
 
     def drop(self, r, body):
