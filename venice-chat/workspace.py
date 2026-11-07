@@ -2,6 +2,8 @@
 
 Модель видит только папки, которые пользователь сам выбрал. При изменениях правь оба файла.
 """
+import base64
+import errno
 import fnmatch
 import json
 import os
@@ -12,13 +14,21 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 SKIP_DIRS = {"node_modules", ".git", ".svn", ".hg", "vendor", ".venv", "venv", "__pycache__", ".pytest_cache",
              ".mypy_cache", ".parcel-cache", ".turbo", ".cache", ".idea", ".vscode", ".gradle", "Pods", "DerivedData",
              ".next", ".nuxt", ".pnpm-store", ".worktrees", "dist", "build", "out", "coverage", ".build", "target"}
+# Рабочие копии архивов: <данные>/work/<чат>/<метка>/<имя>
+WORK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+WORK_SKIP = {"node_modules", ".git", "__pycache__", ".venv", "venv", "Pods", ".gradle", "DerivedData", "jspm_packages"}   # должно быть подмножеством UNPACK_SKIP в archive-work.js
+WORK_MAX_FILES = 100_000
+NOT_WORK = "Это можно только в рабочей копии архива"
+GONE_WORK = "Рабочей копии архива больше нет"
 MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "README.md"]
 MAX_FILE_BYTES = 2 * 1024 * 1024
+GET_MAX_BYTES = 16 * 1024 * 1024   # /api/fs/get вне копии архива
 # Карта кода: шаблоны объявлений (имя — в группе n); те же, что в Workspace.swift
 SYMBOL_PATTERNS = [re.compile(p) for p in [
     r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?P<n>[\w$]+)",
@@ -58,6 +68,10 @@ class Workspace:
         self.folders = data_dir / "folders.json"
         self.backups = data_dir / "backups"
         self.memory_dir = data_dir / "memory"
+        self.work_dir = data_dir / "work"
+        self.folders_lock = threading.Lock()
+        self.work_lock = threading.Lock()   # запись в копию архива и её удаление — по очереди (иначе запись пересоздаст стёртое)
+        self.dropped_chats = set()           # чаты, удалённые за этот запуск: новых копий для них не создаём
         self.running = {}
         self.jobs = {}
         self.job_count = 0
@@ -69,24 +83,150 @@ class Workspace:
         except Exception:
             return []
 
+    def save_folders(self, items):
+        self.data.mkdir(parents=True, exist_ok=True)
+        tmp = self.folders.with_name(f".folders-{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(sorted(set(items))))
+        os.replace(tmp, self.folders)
+
     def allow(self, path):
         p = str(Path(path).expanduser().resolve())
-        items = self.allowed()
-        self.data.mkdir(parents=True, exist_ok=True)
-        if p not in items:
-            self.folders.write_text(json.dumps(sorted(set(items + [p]))))
+        with self.folders_lock:
+            items = self.allowed()
+            if p not in items:
+                self.save_folders(items + [p])
         return p
+
+    def forget_tree(self, base):
+        """Копия архива больше не нужна: закрыть доступ к ней, остановить запущенное в ней и стереть с диска."""
+        inside = lambda p: p == base or p.startswith(base + "/")
+        with self.work_lock, self.folders_lock:   # сначала доступ: запись, которая придёт позже, получит отказ
+            items = self.allowed()
+            keep = [p for p in items if not inside(p)]
+            if len(keep) != len(items):
+                self.save_folders(keep)
+        procs = []
+        for job in list(self.jobs.values()):
+            if inside(job["root"]) and job["proc"].poll() is None:
+                job["stopped"] = True
+                procs.append(job["proc"])
+        # команда в списке, пока не вернулась; poll() не зовём — он «забрал» бы уже вышедшую оболочку
+        procs += [proc for root, proc in list(self.running.values()) if inside(root) and proc.returncode is None]
+        for proc in procs:   # иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+            self.stop_tree(proc)
+        self.stop_left(base)
+        # доступ закрыт под work_lock: запись, начатая раньше, уже закончилась, новая получит отказ — стираем без замка
+        # (иначе большая копия держала бы правки и удаление всех остальных чатов)
+        shutil.rmtree(base, ignore_errors=True)
+
+    # ---- рабочие копии архивов ----
+    def work_base(self, r):
+        work = self.work_dir.resolve()
+        try:
+            parts = r.relative_to(work).parts
+        except ValueError:
+            parts = ()
+        if len(parts) < 2:
+            raise FsError(NOT_WORK)
+        return work / parts[0] / parts[1]
+
+    def work_new(self, body):
+        chat = str(body.get("chat") or "")
+        if not WORK_ID.fullmatch(chat):
+            raise FsError("Неверный id чата")
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(body.get("name") or "")).strip(".-")[:60] or "archive"
+        base = self.work_dir / chat / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+        with self.work_lock:
+            if chat in self.dropped_chats:
+                raise FsError("Чат удалён")
+            (base / name).mkdir(parents=True)
+            return {"base": self.allow(base), "root": self.allow(base / name)}
+
+    def put_files(self, r, body):
+        self.work_base(r)
+        files = body.get("files") or []
+        for f in files:
+            rel = str(f.get("path") or "")
+            p = self.resolve(r, rel)
+            if p == r or p.is_symlink() or p.is_dir():
+                raise FsError(f"Нельзя записать {rel}")
+            try:
+                data = base64.b64decode(str(f.get("data") or ""), validate=True)
+            except ValueError:
+                raise FsError("Повреждённые данные файла")
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "ab" if f.get("append") else "wb") as out:
+                    out.write(data)
+                os.chmod(p, 0o755 if f.get("x") else 0o644)
+            except OSError as e:
+                raise FsError(f"Не удалось записать {rel}: {e.strerror}")
+        return {"written": len(files)}
+
+    def list_all(self, r, body):
+        self.work_base(r)
+        out = []
+        for dirpath, dirnames, filenames in os.walk(r):
+            dirnames[:] = [n for n in dirnames if n not in WORK_SKIP]
+            for n in filenames:
+                p = Path(dirpath) / n
+                if p.is_symlink() or not p.is_file():
+                    continue
+                st = p.stat()
+                out.append({"path": str(p.relative_to(r)), "size": st.st_size, "version": file_version(p), "x": bool(st.st_mode & 0o111)})
+                if len(out) > WORK_MAX_FILES:
+                    raise FsError("В рабочей папке больше 100 000 файлов — собрать архив нельзя")
+        return {"files": out}
+
+    def get_file(self, r, body):
+        """Байты файла: из копии архива — для готового архива, из любой папки — для сверки «�» в целом файле."""
+        p = self.resolve(r, body.get("path"))
+        if p.is_symlink() or not p.is_file():
+            raise FsError(f"Файла {body.get('path')} нет")
+        if self.work_dir.resolve() not in r.parents and p.stat().st_size > GET_MAX_BYTES:
+            raise FsError("Файл слишком большой")
+        return p.read_bytes()
+
+    def drop(self, r, body):
+        self.forget_tree(str(self.work_base(r)))
+        return {"ok": True}
+
+    def drop_work(self, chat_id):
+        """Чат удалён — стираем его рабочие копии архивов."""
+        if not WORK_ID.fullmatch(str(chat_id or "")):
+            return
+        with self.work_lock:
+            self.dropped_chats.add(chat_id)
+        d = self.work_dir / chat_id
+        if d.is_symlink():   # ссылку убираем, а не то, куда она ведёт
+            d.unlink()
+            return
+        if d.is_dir():
+            self.forget_tree(str(d.resolve()))
 
     def root(self, body):
         r = str(body.get("root") or "")
         if not r:
             raise FsError("Папка проекта не выбрана")
         p = Path(r).resolve()
+        work = self.work_dir.resolve()
         if str(p) not in self.allowed():
-            raise FsError(f"Нет доступа к папке {r}: подключите её к проекту заново")
+            raise FsError(GONE_WORK if work in p.parents else f"Нет доступа к папке {r}: подключите её к проекту заново")
         if not p.is_dir():
-            raise FsError(f"Папки {r} больше нет")
+            raise FsError(GONE_WORK if work in p.parents else f"Папки {r} больше нет")
         return p
+
+    @contextmanager
+    def writing(self, r):
+        """Запись в копию архива — под замком и только пока копия разрешена: удаление чата не застанет её на полпути."""
+        work = self.work_dir.resolve()
+        if work not in r.parents:
+            yield
+            return
+        with self.work_lock:
+            if str(r) not in self.allowed():
+                raise FsError(GONE_WORK)
+            yield
 
     def resolve(self, root: Path, rel):
         s = str(rel or "").strip()
@@ -171,14 +311,19 @@ class Workspace:
                 raise FsError(f"Папки {path} нет")
             full = self.allow(p)
             return {"path": full, "name": Path(full).name}
+        if op == "work":
+            return self.work_new(body)
         r = self.root(body)
-        fn = {"info": self.info, "list": self.list, "grep": self.grep, "read": self.read, "write": self.write,
+        fn = {"put": self.put_files, "files": self.list_all, "get": self.get_file, "drop": self.drop, "info": self.info, "list": self.list, "grep": self.grep, "read": self.read, "write": self.write,
               "edit": self.edit, "undo": self.undo, "run": self.run, "memory": self.memory,
               "symbols": self.symbols, "job": self.job}.get(op)
         if op == "run" and body.get("background"):
             fn = self.start_job
         if not fn:
             raise FsError(f"Нет такой операции: {op}")
+        if op in ("put", "write", "edit", "undo"):
+            with self.writing(r):
+                return fn(r, body)
         return fn(r, body)
 
     def info(self, r, body):
@@ -368,10 +513,22 @@ class Workspace:
         if not bid or meta.get("root") != str(r):
             raise FsError("Копия для отмены не найдена")
         p = self.resolve(r, meta["path"])
-        if meta.get("existed"):
-            shutil.copy2(d / "file", p)
-        elif p.exists():
-            p.unlink()
+        if meta.get("existed") and not (d / "file").is_file():
+            raise FsError("Копия для отмены не найдена")
+        if p.is_dir() and not p.is_symlink():
+            raise FsError(f"На месте файла {meta['path']} теперь папка")
+        try:
+            if meta.get("existed"):
+                p.parent.mkdir(parents=True, exist_ok=True)   # папку файла могла переместить или стереть команда
+                if p.is_symlink():   # команда поставила на место файла ссылку — заменяем её, а не пишем туда, куда она ведёт
+                    p.unlink()
+                shutil.copy2(d / "file", p)
+            elif p.exists() or p.is_symlink():
+                p.unlink()
+        except OSError as e:
+            why = {errno.ENOSPC: "на диске нет места", errno.EACCES: "нет прав на запись", errno.EPERM: "нет прав на запись",
+                   errno.ENOTDIR: "на месте его папки теперь файл", errno.EEXIST: "на месте его папки теперь файл"}.get(e.errno, "ошибка записи")
+            raise FsError(f"Не удалось {'вернуть' if meta.get('existed') else 'удалить'} {meta['path']}: {why}")
         return {"ok": True, "path": meta["path"]}
 
     @staticmethod
@@ -448,6 +605,49 @@ class Workspace:
             except Exception:
                 proc.kill()
 
+    @staticmethod
+    def pids_in(base):
+        """pid процессов, чья рабочая папка внутри base (кроме самого сервера)."""
+        inside = lambda p: p == base or p.startswith(base + "/")
+        me, out = os.getpid(), []
+        if Path("/proc/self/cwd").exists():   # Linux
+            for d in os.listdir("/proc"):
+                if d.isdigit() and int(d) != me:
+                    try:
+                        if inside(os.readlink(f"/proc/{d}/cwd")):
+                            out.append(int(d))
+                    except OSError:
+                        pass
+            return out
+        try:   # Mac
+            lsof = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").exists() else "lsof"
+            res = subprocess.run([lsof, "-n", "-d", "cwd", "-F", "pn"], capture_output=True, timeout=15)
+        except Exception:
+            return out
+        pid = 0
+        for line in res.stdout.decode("utf-8", errors="replace").splitlines():
+            if line[:1] == "p":
+                pid = int(line[1:]) if line[1:].isdigit() else 0
+            elif line[:1] == "n" and pid and pid != me and inside(line[1:]):
+                out.append(pid)
+        return out
+
+    def stop_left(self, base):
+        """То, что пережило свою оболочку (cmd &, setsid, вывод в файл) и ещё работает в папке: SIGTERM, через 3 с — SIGKILL."""
+        def send(sig):
+            for pid in self.pids_in(base):
+                try:
+                    os.kill(pid, sig)
+                except Exception:
+                    pass
+        if not self.pids_in(base):
+            return
+        send(signal.SIGTERM)
+        end = time.time() + 3
+        while time.time() < end and self.pids_in(base):
+            time.sleep(0.2)
+        send(signal.SIGKILL)
+
     def stop_all_jobs(self):
         for job in self.jobs.values():
             if job["proc"].poll() is None:
@@ -463,6 +663,7 @@ class Workspace:
         # своя группа процессов: по таймауту останавливаем и всё, что команда запустила
         proc = subprocess.Popen([shell, "-lc", cmd], cwd=r, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        self.running[id(proc)] = (str(r), proc)   # чтобы удаление копии архива могло её остановить
         try:
             data, _ = proc.communicate(timeout=timeout)
             code = proc.returncode
@@ -473,6 +674,8 @@ class Workspace:
                 data, _ = proc.communicate(timeout=3)
             except subprocess.TimeoutExpired:
                 data = b""
+        finally:
+            self.running.pop(id(proc), None)
         text = (data or b"").decode("utf-8", errors="replace")
         if len(text) > MAX_OUTPUT:
             text = text[:MAX_OUTPUT // 3] + f"\n…[вывод сокращён: {len(text)} символов]…\n" + text[-MAX_OUTPUT * 2 // 3:]

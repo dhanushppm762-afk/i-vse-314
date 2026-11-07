@@ -12,15 +12,21 @@ return JSON.stringify(await window.runEval({ compare: mode === "compare", only }
     static let agentScript = #"""
 await new Promise(r => setTimeout(r, 2500));
 const before = S.settings.browserTool;
-S.settings.browserTool = !folder; setMode("chat"); newChat();
+S.settings.browserTool = !folder && !zipB64; setMode("chat"); newChat();
 if (folder) S.pendingFolder = { path: folder, name: folder.split("/").pop() };
 $("#input").value = task; autoGrow();
 // в тесте на запросы разрешения отвечаем «запретить» (при VENICE_AGENTTEST_DENY); с папкой — «разрешить»
-const iv = deny || folder ? setInterval(() => { for (const r of [...S.approvals.values()]) r(!deny); }, 300) : 0;
+const iv = deny || folder || zipB64 ? setInterval(() => { for (const r of [...S.approvals.values()]) r(!deny); }, 300) : 0;
+// VENICE_AGENTTEST_ZIP: архив прикладывается к заданию, как если бы его прислал пользователь
+if (zipB64) await addFiles([new File([Uint8Array.from(atob(zipB64), c => c.charCodeAt(0))], zipTitle)]);
 await send();
 clearInterval(iv);
 const m = S.chat.messages.at(-1);
 const out = { steps: (m.steps || []).map(s => s.status + ": " + s.text), plan: m.plan || null, answer: (m.content || "").slice(0, 1500), error: m.error || null, usage: m.usage || null };
+// что попало бы в готовый архив (до удаления чата — вместе с ним стирается и копия)
+const wa = activeArchive(S.chat);
+if (wa) { try { out.pack = (await packWork(wa.work.base, wa.work.root)).report; } catch (e) { out.pack = "ошибка: " + e.message; } }
+for (const f of S.chat.messages.flatMap(m => m.files || [])) if (f.archive?.work) await fsApi("drop", { root: f.archive.work.base }).catch(() => {});
 S.chat.deleted = true; await new Promise(r => setTimeout(r, 800)); await api.remove(S.chat.id); S.chats = S.chats.filter(c => c.id !== S.chat.id);
 S.settings.browserTool = before; saveSettings();
 return JSON.stringify(out);
@@ -149,6 +155,30 @@ try {
   const sym = await fs("symbols", {});
   r.fsSymbols = sym.files + " file(s): " + sym.map;
 } catch (e) { r.fsError = String(e); }
+// Правка архива: распаковка в рабочую копию, правка, сборка готового архива
+try {
+  const z = new JSZip();
+  z.file("site/index.html", "<h1>Привет</h1>\n"); z.file("site/css/style.css", "h1{color:red}\n");
+  z.file("site/run.sh", "echo hi\n", { unixPermissions: 0o100755 }); z.file("site/node_modules/x/i.js", "x");
+  z.file("site/big.bin", new Uint8Array(5 * 1024 * 1024 + 7).fill(7));   // больше одной части записи — проверяет дозапись и большие тела запросов
+  const blob = await z.generateAsync({ type: "blob", platform: "UNIX" });
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer(), { decodeFileName: AW.zipName });
+  const plan = AW.planUnpack(zip);
+  const made = await unpackArchive({ id: "selftest_work" }, { steps: [] }, { name: "site.zip" }, blob, plan, zip, { status: "run", text: "" });
+  await fsApi("edit", { root: made.root, path: "index.html", old: "Привет", new: "Здравствуйте" });
+  await fsApi("write", { root: made.root, path: "новый.js", content: "console.log(1)\n" });
+  const { blob: out, report } = await packWork(made.base, made.root);
+  const res = await JSZip.loadAsync(await out.arrayBuffer());
+  r.workRoundtrip = plan.prefix === "site/" && plan.deps.join() === "node_modules" && report.changed.join() === "index.html" && report.added.join() === "новый.js" &&
+    (await res.file("site/index.html").async("string")).includes("Здравствуйте") && !!res.file("site/node_modules/x/i.js") &&
+    (res.file("site/run.sh").unixPermissions & 0o111) !== 0 && (await res.file("site/big.bin").async("uint8array")).length === 5 * 1024 * 1024 + 7;
+  r.workIbm866 = AW.zipName(new Uint8Array([0x8f, 0xe0, 0xa8])) === "При";
+  r.workRefuse = /рабочей копии/.test((await fs("put", { files: [{ path: "x.txt", data: "eA==" }] })).error || "");
+  await fetch("/api/chats/selftest_work", { method: "DELETE" }); await new Promise(res => setTimeout(res, 500));
+  r.workDropped = /Нет доступа|больше нет/.test((await fetch("/api/fs/files", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root: made.root }) }).then(x => x.json())).error || "");
+  r.workUI = typeof downloadArchive === "function" && typeof prepareWorkCopy === "function" && FS_TOOLS.length === 13 && typeof activeArchive === "function" &&
+    !!document.querySelector('script[src="archive-work.js"]');
+} catch (e) { r.workError = String(e); await fetch("/api/chats/selftest_work", { method: "DELETE" }).catch(() => {}); }
 return JSON.stringify(r);
 """#
 }

@@ -22,6 +22,13 @@ final class Workspace {
     private var foldersURL: URL { dataDir.appendingPathComponent("folders.json") }
     private var backupsDir: URL { dataDir.appendingPathComponent("backups", isDirectory: true) }
     private var memoryDir: URL { dataDir.appendingPathComponent("memory", isDirectory: true) }
+    private var workDir: URL { dataDir.appendingPathComponent("work", isDirectory: true) }
+    private let foldersLock = NSLock()
+    private let workLock = NSLock()            // запись в копию архива и её удаление — по очереди (иначе запись пересоздаст стёртое)
+    private var droppedChats = Set<String>()   // под workLock: чаты, удалённые за этот запуск, — новых копий для них не создаём
+    private static let goneWork = "Рабочей копии архива больше нет"
+    static let workSkip: Set<String> = ["node_modules", ".git", "__pycache__", ".venv", "venv", "Pods", ".gradle", "DerivedData", "jspm_packages"]   // ⊆ UNPACK_SKIP в archive-work.js
+    private static let notWork = "Это можно только в рабочей копии архива"
 
     // MARK: разрешённые папки
 
@@ -34,12 +41,15 @@ final class Workspace {
 
     func allow(_ path: String) {
         let p = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        foldersLock.lock(); defer { foldersLock.unlock() }
         if !allowed.contains(p) { allowed += [p] }
     }
 
     // для самотестов: убрать временную папку из разрешённых и стереть заметки о ней
     func forget(_ path: String) {
+        foldersLock.lock()
         allowed = allowed.filter { $0 != path }
+        foldersLock.unlock()
         try? FileManager.default.removeItem(at: memoryURL(URL(fileURLWithPath: path)))
     }
 
@@ -49,10 +59,21 @@ final class Workspace {
     private func root(_ body: [String: Any]) throws -> URL {
         guard let r = body["root"] as? String, !r.isEmpty else { throw FsError("Папка проекта не выбрана") }
         let url = URL(fileURLWithPath: r).resolvingSymlinksInPath()
-        guard allowed.contains(url.path) else { throw FsError("Нет доступа к папке \(r): подключите её к проекту заново") }
+        let inWork = isWork(url)
+        guard allowed.contains(url.path) else { throw FsError(inWork ? Self.goneWork : "Нет доступа к папке \(r): подключите её к проекту заново") }
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { throw FsError("Папки \(r) больше нет") }
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { throw FsError(inWork ? Self.goneWork : "Папки \(r) больше нет") }
         return url
+    }
+
+    private func isWork(_ url: URL) -> Bool { url.path.hasPrefix(workDir.resolvingSymlinksInPath().path + "/") }
+
+    /// Запись в копию архива — под замком и только пока копия разрешена: удаление чата не застанет её на полпути
+    private func guarded(_ r: URL, _ body: () throws -> [String: Any]) throws -> [String: Any] {
+        guard isWork(r) else { return try body() }
+        workLock.lock(); defer { workLock.unlock() }
+        guard allowed.contains(r.path) else { throw FsError(Self.goneWork) }
+        return try body()
     }
 
     /// Путь внутри проекта; выйти за его пределы (../, ссылки) нельзя
@@ -83,20 +104,25 @@ final class Workspace {
         let id = ObjectIdentifier(t)
         queue.async { [self] in
             do {
+                if op == "work" { let made = try makeWork(body); b.json(t, 200, made); return }
                 let r = try root(body)
+                if op == "get" { let data = try getFile(r, body); b.respond(t, 200, data, type: "application/octet-stream"); return }
                 let out: [String: Any]
                 switch op {
                 case "info": out = info(r)
                 case "list": out = try list(r, body)
                 case "grep": out = try grep(r, body)
                 case "read": out = try read(r, body)
-                case "write": out = try write(r, body)
-                case "edit": out = try edit(r, body)
-                case "undo": out = try undo(r, body)
+                case "write": out = try guarded(r) { try write(r, body) }
+                case "edit": out = try guarded(r) { try edit(r, body) }
+                case "undo": out = try guarded(r) { try undo(r, body) }
                 case "run": out = body["background"] as? Bool == true ? try startJob(r, body) : try run(r, body, id: id)
                 case "job": out = try jobStatus(r, body)
                 case "memory": out = memory(r, body)
                 case "symbols": out = try symbols(r, body)
+                case "put": out = try guarded(r) { try putFiles(r, body) }
+                case "files": out = try listAll(r)
+                case "drop": out = try dropWork(r)
                 default: throw FsError("Нет такой операции: \(op)")
                 }
                 b.json(t, 200, out)
@@ -373,13 +399,36 @@ final class Workspace {
         guard !id.isEmpty, let meta = (try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meta.json")))) as? [String: Any],
               meta["root"] as? String == r.path else { throw FsError("Копия для отмены не найдена") }
         let url = try resolve(r, meta["path"])
+        let path = meta["path"] as? String ?? ""
+        let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
+        var isDir: ObjCBool = false
+        if !link, FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue { throw FsError("На месте файла \(path) теперь папка") }
         if meta["existed"] as? Bool == true {
-            let data = try Data(contentsOf: dir.appendingPathComponent("file"))
-            try data.write(to: url, options: .atomic)
-        } else {
-            try? FileManager.default.removeItem(at: url)
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("file")) else { throw FsError("Копия для отмены не найдена") }
+            do {
+                // папку файла могла переместить или стереть команда; ссылку на месте файла убираем — пишем не туда, куда она ведёт
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if link { try FileManager.default.removeItem(at: url) }
+                try data.write(to: url, options: .atomic)
+            } catch { throw FsError("Не удалось вернуть \(path): \(Self.writeWhy(error))") }
+        } else if link || FileManager.default.fileExists(atPath: url.path) {
+            do { try FileManager.default.removeItem(at: url) }
+            catch { throw FsError("Не удалось удалить \(path): \(Self.writeWhy(error))") }
         }
         return ["ok": true, "path": meta["path"] as? String ?? ""]
+    }
+
+    /// Причина ошибки записи по-русски (как в Python-версии)
+    private static func writeWhy(_ error: Error) -> String {
+        let e = error as NSError
+        var posix = 0
+        if e.domain == NSPOSIXErrorDomain { posix = e.code }
+        else if let u = e.userInfo[NSUnderlyingErrorKey] as? NSError, u.domain == NSPOSIXErrorDomain { posix = u.code }
+        let cocoa = e.domain == NSCocoaErrorDomain ? e.code : -1
+        if cocoa == NSFileWriteOutOfSpaceError || posix == Int(ENOSPC) { return "на диске нет места" }
+        if cocoa == NSFileWriteNoPermissionError || posix == Int(EACCES) || posix == Int(EPERM) { return "нет прав на запись" }
+        if cocoa == NSFileWriteFileExistsError || posix == Int(ENOTDIR) || posix == Int(EEXIST) { return "на месте его папки теперь файл" }
+        return "ошибка записи"
     }
 
     private func run(_ r: URL, _ body: [String: Any], id: ObjectIdentifier) throws -> [String: Any] {
@@ -492,8 +541,9 @@ final class Workspace {
         return out
     }
 
-    /// Останавливает команду вместе с запущенными ею процессами (npm, сервер и т. п.)
-    private func stopTree(_ p: Process) {
+    /// Останавливает команду вместе с запущенными ею процессами (npm, сервер и т. п.); возвращает pid найденных потомков
+    @discardableResult
+    private func stopTree(_ p: Process, _ sig: Int32 = SIGTERM) -> [Int32] {
         func kids(_ pid: Int32) -> [Int32] {
             let q = Process(); q.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); q.arguments = ["-P", String(pid)]
             let pipe = Pipe(); q.standardOutput = pipe; q.standardError = FileHandle.nullDevice
@@ -503,8 +553,37 @@ final class Workspace {
         }
         var all: [Int32] = [], queue = [p.processIdentifier]
         while let pid = queue.popLast(), all.count < 500 { let k = kids(pid); all += k; queue += k }
-        for pid in all.reversed() { kill(pid, SIGTERM) }
-        p.terminate()
+        for pid in all.reversed() { kill(pid, sig) }
+        if sig == SIGTERM { p.terminate() } else if p.isRunning { kill(p.processIdentifier, sig) }
+        if sig == SIGTERM {   // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко, как в Python-версии
+            let pids = all
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
+        return all
+    }
+
+    /// pid процессов, чья рабочая папка внутри base (по lsof, кроме самого приложения): так находится и то,
+    /// что пережило свою оболочку (cmd &, вывод в файл) — его уже не видно через pgrep -P
+    private func pidsIn(_ base: String) -> [Int32] {
+        let q = Process(); q.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof"); q.arguments = ["-n", "-d", "cwd", "-F", "pn"]
+        let pipe = Pipe(); q.standardOutput = pipe; q.standardError = FileHandle.nullDevice
+        guard (try? q.run()) != nil else { return [] }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15) { if q.isRunning { q.terminate() } }   // lsof завис — не ждём вечно
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()   // до waitUntilExit: вывод больше буфера канала
+        q.waitUntilExit()
+        let me = getpid()
+        var out: [Int32] = [], pid: Int32 = 0
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            if line.hasPrefix("p") { pid = Int32(line.dropFirst()) ?? 0 }
+            else if line.hasPrefix("n"), pid > 0, pid != me {
+                let path = String(line.dropFirst())
+                if path == base || path.hasPrefix(base + "/") { out.append(pid) }
+            }
+        }
+        return out
     }
 
     /// Выход из приложения — фоновые команды не оставляем
@@ -567,6 +646,144 @@ final class Workspace {
             return true
         }
         return ["map": lines.joined(separator: "\n"), "files": files, "truncated": truncated]
+    }
+
+    // MARK: рабочие копии архивов (/api/fs/work|put|files|get|drop) — те же операции в workspace.py
+
+    /// Папка одной копии: <данные>/work/<чат>/<метка>. Новые операции работают только внутри неё
+    private func workBase(_ r: URL) throws -> String {
+        let work = workDir.resolvingSymlinksInPath().path + "/"
+        guard r.path.hasPrefix(work) else { throw FsError(Self.notWork) }
+        let rest = r.path.dropFirst(work.count).split(separator: "/")
+        guard rest.count >= 2 else { throw FsError(Self.notWork) }
+        return work + String(rest[0]) + "/" + String(rest[1])
+    }
+
+    /// Новая рабочая копия: <данные>/work/<чат>/<время-случайное>/<имя латиницей>
+    private func makeWork(_ body: [String: Any]) throws -> [String: Any] {
+        let chat = body["chat"] as? String ?? ""
+        guard chat.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else { throw FsError("Неверный id чата") }
+        var name = (body["name"] as? String ?? "").replacingOccurrences(of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
+        name = String(name.trimmingCharacters(in: CharacterSet(charactersIn: ".-")).prefix(60))
+        if name.isEmpty { name = "archive" }
+        let stamp = "\(Int64(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(6).lowercased())"
+        let base = workDir.appendingPathComponent(chat, isDirectory: true).appendingPathComponent(stamp, isDirectory: true)
+        let root = base.appendingPathComponent(name, isDirectory: true)
+        workLock.lock(); defer { workLock.unlock() }
+        guard !droppedChats.contains(chat) else { throw FsError("Чат удалён") }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        allow(base.path)
+        allow(root.path)
+        return ["base": base.resolvingSymlinksInPath().path, "root": root.resolvingSymlinksInPath().path]
+    }
+
+    /// Запись файлов в копию: data — base64; append — дописать в конец (большие файлы идут частями)
+    private func putFiles(_ r: URL, _ body: [String: Any]) throws -> [String: Any] {
+        _ = try workBase(r)
+        let files = body["files"] as? [[String: Any]] ?? []
+        for f in files {
+            let path = f["path"] as? String ?? ""
+            let url = try resolve(r, path)
+            let v = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard url.path != r.path, v?.isDirectory != true, v?.isSymbolicLink != true else { throw FsError("Нельзя записать \(path)") }
+            guard let data = Data(base64Encoded: f["data"] as? String ?? "") else { throw FsError("Повреждённые данные файла") }
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if f["append"] as? Bool == true, FileManager.default.fileExists(atPath: url.path) {
+                let h = try FileHandle(forWritingTo: url)
+                defer { try? h.close() }
+                _ = try h.seekToEnd()
+                try h.write(contentsOf: data)
+            } else {
+                try data.write(to: url)
+            }
+            let mode = f["x"] as? Bool == true ? 0o755 : 0o644
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        }
+        return ["written": files.count]
+    }
+
+    /// Все файлы копии с версиями — по ним приложение понимает, что изменилось. Без папок зависимостей и ссылок
+    private func listAll(_ r: URL) throws -> [String: Any] {
+        _ = try workBase(r)
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        // без .skipsPackageDescendants и со скрытыми файлами: иначе файлы из App.xcodeproj или .htaccess сочтутся удалёнными
+        guard let en = FileManager.default.enumerator(at: r, includingPropertiesForKeys: keys, options: []) else { return ["files": [[String: Any]]()] }
+        var out: [[String: Any]] = []
+        for case let url as URL in en {
+            let v = try? url.resourceValues(forKeys: Set(keys))
+            if v?.isSymbolicLink == true { continue }
+            if v?.isDirectory == true {
+                if Self.workSkip.contains(url.lastPathComponent) { en.skipDescendants() }
+                continue
+            }
+            guard v?.isRegularFile == true, let a = try? FileManager.default.attributesOfItem(atPath: url.path) else { continue }
+            let perm = (a[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            out.append(["path": rel(r, url), "size": (a[.size] as? NSNumber)?.intValue ?? 0, "version": version(url) ?? "", "x": (perm & 0o111) != 0])
+            if out.count > 100_000 { throw FsError("В рабочей папке больше 100 000 файлов — собрать архив нельзя") }
+        }
+        return ["files": out]
+    }
+
+    /// Байты файла: из копии архива — для готового архива, из любой папки — для сверки «�» в целом файле
+    private func getFile(_ r: URL, _ body: [String: Any]) throws -> Data {
+        let path = body["path"] as? String ?? ""
+        let url = try resolve(r, path)
+        let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard v?.isRegularFile == true, v?.isSymbolicLink != true else { throw FsError("Файла \(path) нет") }
+        if !isWork(r), (v?.fileSize ?? 0) > 16 * 1024 * 1024 { throw FsError("Файл слишком большой") }
+        return try Data(contentsOf: url)
+    }
+
+    private func dropWork(_ r: URL) throws -> [String: Any] {
+        let base = try workBase(r)
+        forgetTree(base)
+        return ["ok": true]
+    }
+
+    /// Чат удалён — стираем его рабочие копии (вызывает Backend при DELETE /api/chats/<id>)
+    func dropChatWork(_ chat: String) {
+        guard chat.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else { return }
+        workLock.lock(); droppedChats.insert(chat); workLock.unlock()
+        let dir = workDir.appendingPathComponent(chat, isDirectory: true)
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: dir.path)) != nil {
+            try? FileManager.default.removeItem(atPath: dir.path)   // ссылку убираем, а не то, куда она ведёт
+            return
+        }
+        guard FileManager.default.fileExists(atPath: dir.path) else { return }
+        forgetTree(dir.resolvingSymlinksInPath().path)
+    }
+
+    /// Закрыть доступ к копии (и всему внутри), остановить запущенное в ней и стереть с диска
+    private func forgetTree(_ base: String) {
+        let inside = { (p: String) -> Bool in p == base || p.hasPrefix(base + "/") }
+        workLock.lock()   // сначала доступ: запись, которая придёт позже, получит отказ
+        foldersLock.lock()
+        allowed = allowed.filter { !inside($0) }
+        foldersLock.unlock()
+        workLock.unlock()
+        var procs: [Process] = []
+        lock.lock()
+        for job in jobs.values where job.p.isRunning && inside(job.root) { job.stopped = true; procs.append(job.p) }
+        for p in running.values where p.isRunning && inside(p.currentDirectoryURL?.path ?? "") { procs.append(p) }
+        lock.unlock()
+        var pids: [Int32] = []
+        for p in procs { pids += stopTree(p) }   // иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
+        // и то, что пережило свою оболочку и ещё работает в копии
+        let left = pidsIn(base).filter { !pids.contains($0) }
+        for pid in left { kill(pid, SIGTERM) }
+        pids += left
+        if !procs.isEmpty || !pids.isEmpty {   // ничего не работало — ждать нечего
+            let alive = { (pid: Int32) -> Bool in kill(pid, 0) == 0 }
+            let until = Date().addingTimeInterval(3)
+            while (procs.contains(where: { $0.isRunning }) || pids.contains(where: alive)) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
+            // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко; и то, что появилось за это время
+            for p in procs where p.isRunning { stopTree(p, SIGKILL) }
+            for pid in pids where alive(pid) { kill(pid, SIGKILL) }
+            for pid in pidsIn(base) { kill(pid, SIGKILL) }
+        }
+        // доступ закрыт под workLock: запись, начатая раньше, уже закончилась, новая получит отказ — стираем без замка
+        // (иначе большая копия держала бы правки и удаление всех остальных чатов)
+        try? FileManager.default.removeItem(atPath: base)
     }
 
     // Заметки модели о проекте — хранятся у приложения, в папку пользователя не пишутся
