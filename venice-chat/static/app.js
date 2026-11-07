@@ -1443,8 +1443,10 @@ function zipSig(entries) {
   const rows = [];
   for (const e of entries) {
     const d = e._data;
-    if (!d || typeof d.crc32 !== "number") return "";
-    rows.push(`${e.name}\u0000${d.crc32}\u0000${d.uncompressedSize}`);
+    // у пустого файла JSZip вместо данных оглавления держит обещание пустой строки: CRC32 и размер у него — 0
+    const empty = !!d && typeof d.then === "function";
+    if (!empty && (!d || typeof d.crc32 !== "number")) return "";
+    rows.push(`${e.name}\u0000${empty ? 0 : d.crc32}\u0000${empty ? 0 : d.uncompressedSize}`);
   }
   const s = rows.sort().join("\n");
   let h1 = 0xdeadbeef, h2 = 0x41c6ce57;   // cyrb53: 53-битный хэш строки
@@ -1851,7 +1853,8 @@ const activeArchive = chat => chat?.folder?.work ? workArchive(chat, chat.folder
 const workRootOf = chat => activeArchive(chat) && findModel("text", chat.model)?.tools !== false ? chat.folder.path : null;
 // прежние версии активного архива: тот же архив, присланный раньше него, который только читается (до перезапуска и т. п.)
 // тот же файл (приложили дважды): совпадает отпечаток — имена, размеры и CRC32 всех файлов внутри (sig);
-// у архивов, приложенных до 3.11, отпечатка нет — сверяем имена и размеры файлов, сохранённые тексты и картинки
+// у архивов, приложенных до 3.11 (и если JSZip не дал оглавления), отпечатка нет — сверяем имена и размеры файлов,
+// сохранённые тексты и картинки
 const sameArchive = (x, y) => x.name === y.name && x.size === y.size && (x.sig || y.sig ? x.sig === y.sig :
   x.tree.length === y.tree.length && x.tree.every((t, i) => t[0] === y.tree[i][0] && t[1] === y.tree[i][1]) &&
   Object.keys(x.files || {}).every(k => x.files[k] === y.files?.[k]) && Object.keys(x.pictures || {}).every(k => x.pictures[k] === y.pictures?.[k]));
@@ -2288,7 +2291,7 @@ function archiveTool(name, args, list) {
   return { label: `Неизвестный инструмент ${name}`, error: true, text: "Нет такого инструмента" };
 }
 
-const archiveRules = (list, why = a => !a.work && a.readOnly) => `К разговору приложены архивы: ${list.map(a => `«${a.name}» (${a.tree.filter(t => t[2] === "inline" || t[2] === "read").length} текстовых файлов)`).join(", ")}.
+const archiveRules = (list, why = a => !a.work && a.readOnly) => `К разговору приложены архивы: ${list.map(a => `«${a.name}» (${plural(a.tree.filter(t => t[2] === "inline" || t[2] === "read").length, "текстовый файл", "текстовых файла", "текстовых файлов")})`).join(", ")}.
 Часть файлов уже вставлена в сообщения (пометка «✓ ниже»), остальные открывай инструментом archive_read — ты можешь прочитать любой файл из любой папки. Список файлов — archive_list, поиск по всем файлам — archive_search.
 Если задача касается всего проекта или сайта — сначала посмотри дерево файлов и прочитай все нужные файлы, а не угадывай их содержимое. Не говори, что не видишь файл, пока не попробовал archive_read.
 Картинки архива (логотипы, фоны, иконки) смотри инструментом archive_view_image — только те, что нужны для задачи.
@@ -2837,7 +2840,8 @@ async function runAgent(chat) {
         const map = await codeMap(folder.path, w?.codeDir, 16_000);
         if (map?.map) { info.map = map.map; info.mapTruncated = map.truncated; }
         // их модель видит в правилах; в чате — только последний набор (не растёт с каждым ответом)
-        const fw = new Set(brokenWords([info.map, info.notes, ...(info.docs || []).map(d => d.text)].filter(Boolean).join("\n")));
+        const fw = new Set(brokenWords([info.name, ...(info.entries || []), ...Object.keys(info.top || {}), info.map, info.notes,
+          ...(info.docs || []).map(d => d.text)].filter(x => typeof x === "string" && x).join("\n")));
         FOLDER_BROKEN.set(msg, fw);
         if (fw.size) chat.folderBroken = [...fw].slice(-500); else delete chat.folderBroken;
       }
