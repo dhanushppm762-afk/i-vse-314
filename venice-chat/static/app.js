@@ -962,6 +962,7 @@ async function sendImage(mode) {
 async function upscale(src) {
   if (S.stream) return toast("Дождитесь окончания");
   if (!S.chat) return;
+  if (reverting(S.chat)) return toast(WAIT_REVERT);
   startTurn({ role: "user", content: "", mode: "upscale", params: { model: "upscaler", scale: 2 }, files: [{ name: "картинка." + imageExt(src), kind: "image", data: src }] });
   await runImage(S.chat);
 }
@@ -1436,6 +1437,23 @@ const plural = (n, one, few, many) => {
   return `${n} ${m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many}`;
 };
 
+// отпечаток архива по оглавлению, которое уже прочитал JSZip: имена, размеры и CRC32 файлов. У одного и того же файла
+// он одинаковый, у архивов, где хоть один файл отличается, — разный. _data — внутреннее поле JSZip 3: нет его — нет и отпечатка
+function zipSig(entries) {
+  const rows = [];
+  for (const e of entries) {
+    const d = e._data;
+    if (!d || typeof d.crc32 !== "number") return "";
+    rows.push(`${e.name}\u0000${d.crc32}\u0000${d.uncompressedSize}`);
+  }
+  const s = rows.sort().join("\n");
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;   // cyrb53: 53-битный хэш строки
+  for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${entries.length}-${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
+}
+
 // Читает архив целиком. В сообщение вставляется столько текста, сколько позволяет budget,
 // а все остальные файлы сохраняются в archive.files — модель дочитает их инструментами archive_*.
 async function readZip(file, { budget = MAX_TEXT_CHARS, only = null, keep = false } = {}) {
@@ -1443,6 +1461,7 @@ async function readZip(file, { budget = MAX_TEXT_CHARS, only = null, keep = fals
   const buf = await readAs(file, "readAsArrayBuffer");
   const zip = await JSZip.loadAsync(buf, { decodeFileName: AW.zipName });
   const all = Object.values(zip.files).filter(e => !e.dir && !ZIP_JUNK.test(e.name) && (!only || only(e.name)));
+  const sig = zipSig(all);
   const isSource = n => TEXT_EXT.test(n) && !ZIP_DEPS.test(n) && !ZIP_BUILD.test(n) && !ZIP_NOISE.test(n);
   const skipBuild = all.some(e => isSource(e.name));
   const skip = { deps: new Set(), depsCount: 0, build: new Set(), buildCount: 0, noise: 0, binary: 0, nested: 0, images: 0, full: 0, cut: 0 };
@@ -1521,6 +1540,7 @@ async function readZip(file, { budget = MAX_TEXT_CHARS, only = null, keep = fals
     (later ? `, ещё ${later} модель прочитает сама по мере надобности` : "") + (why.length ? `; пропущено: ${why.join("; ")}` : "");
   const archive = { name: file.name, files, pictures, tree: tree.map(t => [t.path, t.size || 0, t.st]) };
   archive.size = buf.byteLength;
+  if (sig) archive.sig = sig;
   // исходные байты — чтобы ИИ мог править архив и отдать готовый (для /tree/… берётся только подпапка — такой не правим)
   if (keep && !only && buf.byteLength <= AW.LIMITS.zip) ZIP_SRC.set(archive, new Blob([buf], { type: "application/zip" }));
   if (keep && only) archive.noEdit = "это только папка из репозитория — чтобы ИИ правил файлы и собрал готовый архив, пришлите ссылку на весь репозиторий";
@@ -1830,8 +1850,11 @@ const activeArchive = chat => chat?.folder?.work ? workArchive(chat, chat.folder
 // корень активной копии, если модель умеет инструменты (без них архив идёт в сообщении текстом, как раньше)
 const workRootOf = chat => activeArchive(chat) && findModel("text", chat.model)?.tools !== false ? chat.folder.path : null;
 // прежние версии активного архива: тот же архив, присланный раньше него, который только читается (до перезапуска и т. п.)
-// тот же файл (приложили дважды): имя, размер и все файлы внутри совпадают
-const sameArchive = (x, y) => x.name === y.name && x.size === y.size && x.tree.length === y.tree.length && x.tree.every((t, i) => t[0] === y.tree[i][0] && t[1] === y.tree[i][1]);
+// тот же файл (приложили дважды): совпадает отпечаток — имена, размеры и CRC32 всех файлов внутри (sig);
+// у архивов, приложенных до 3.11, отпечатка нет — сверяем имена и размеры файлов, сохранённые тексты и картинки
+const sameArchive = (x, y) => x.name === y.name && x.size === y.size && (x.sig || y.sig ? x.sig === y.sig :
+  x.tree.length === y.tree.length && x.tree.every((t, i) => t[0] === y.tree[i][0] && t[1] === y.tree[i][1]) &&
+  Object.keys(x.files || {}).every(k => x.files[k] === y.files?.[k]) && Object.keys(x.pictures || {}).every(k => x.pictures[k] === y.pictures?.[k]));
 function supersededArchives(chat) {
   const active = activeArchive(chat), out = new Set();
   if (!active) return out;
@@ -1895,7 +1918,10 @@ async function prepareWorkCopy(chat, msg, signal) {
   const current = folderOf(chat);
   const users = chat.messages.filter(m => m.role === "user");
   const lastUser = users[users.length - 1];
-  const note = text => { msg.steps.push({ status: "note", text }); scheduleUpdate(chat, msg); };
+  const note = text => {   // одинаковую заметку дважды не пишем (два одноимённых архива с одной причиной)
+    if (msg.steps.some(st => st.status === "note" && st.text === text)) return;
+    msg.steps.push({ status: "note", text }); scheduleUpdate(chat, msg);
+  };
   const oneAtATime = (b, act) => `править можно один архив за раз — сейчас это ${act.name === b.name ? `другой архив с тем же именем («${act.name}»)` : `«${act.name}»`}`;
   const cands = [], temp = [];
   const act = activeArchive(chat), pos = x => chat.messages.findIndex(m => (m.files || []).some(f => f.archive === x)), actPos = act ? pos(act) : -1;
@@ -2027,6 +2053,7 @@ async function downloadArchive(chat, root) {
   const a = workArchive(chat, root);
   if (!a || S.packing) return;
   if (streamOf(chat) && chat.folder?.path === root) return toast("Дождитесь окончания ответа — ИИ ещё меняет файлы");
+  if (reverting(chat)) return toast(WAIT_REVERT);   // иначе в архив попадут файлы, откаченные наполовину
   const busy = on => document.querySelectorAll('[data-act="download-archive"]').forEach(b => { b.disabled = on; b.querySelector("span").textContent = on ? "Собираю архив…" : "Скачать готовый архив"; });
   S.packing = root; busy(true);
   toast("Собираю готовый архив…", 60_000);
@@ -2048,7 +2075,7 @@ async function downloadArchive(chat, root) {
 // которые ещё возвращаются (в памяти, в сохранённый чат не идёт)
 const REVERTING = new WeakSet();
 const reverting = chat => !!chat && REVERTING.has(chat);
-const WAIT_REVERT = "Подождите: отменяю правки прошлого ответа";
+const WAIT_REVERT = "Подождите: отменяю правки";
 async function revertDropped(chat, dropped) {
   REVERTING.add(chat);
   try { return await revertDroppedNow(chat, dropped); } finally { REVERTING.delete(chat); }
@@ -2166,7 +2193,7 @@ const ARCHIVE_CHUNK = 60_000;
 function readOnlyWhy(chat, folder) {
   // не из сообщений чата — значит, из файлов проекта (кэш проекта может смениться посреди запроса — по нему не сверяем)
   const inChat = new Set(chat.messages.flatMap(m => (m.files || []).map(f => f.archive)).filter(Boolean));
-  return a => !a.work && (a.readOnly || (folder && !inChat.has(a) ? "архив из файлов проекта — его файлов нет в папке, с которой ты работаешь" : ""));
+  return a => !a.work && (a.readOnly || (folder && !inChat.has(a) ? "архив из файлов проекта — правки в папке, с которой ты работаешь, его не меняют" : ""));
 }
 function archivesFor(chat) {
   const list = [];
@@ -2579,12 +2606,13 @@ function userBroken(chat) {
   if (p) { add(p.name); add(p.description); add(p.instructions); for (const f of p.files || []) { add(f.name); add(f.data); } }
   return out;
 }
-// «�»-слова из карты кода и заметок о папке: их заново берут в начале каждого ответа — в памяти, в чат не сохраняем
+// «�»-слова из карты кода и заметок о папке: их берут заново в начале каждого ответа с папкой (FOLDER_BROKEN, в памяти);
+// последние 500 из них хранит и чат (chat.folderBroken, заменяются каждым таким ответом) — их знают и ответы без папки
 const FOLDER_BROKEN = new WeakMap();
 function knownBroken(chat, msg) {   // и слова из файлов и выводов команд, которые ИИ видел в этом чате (msg.seenBroken)
   const known = userBroken(chat);
   for (const m of new Set([...(chat.messages || []), msg])) for (const w of m?.seenBroken || []) known.add(w);
-  for (const w of FOLDER_BROKEN.get(msg) || []) known.add(w);
+  for (const w of FOLDER_BROKEN.get(msg) || chat.folderBroken || []) known.add(w);
   return known;
 }
 // запомнить «�»-слова, которые ИИ увидел в файлах и выводе команд, — в самом ответе (сохраняется с чатом, переживает
@@ -2808,8 +2836,10 @@ async function runAgent(chat) {
         info = await fsApi("info", { root: folder.path });
         const map = await codeMap(folder.path, w?.codeDir, 16_000);
         if (map?.map) { info.map = map.map; info.mapTruncated = map.truncated; }
-        // их модель видит в правилах; в чат не сохраняем — в следующем ответе их возьмут заново
-        FOLDER_BROKEN.set(msg, new Set(brokenWords([info.map, info.notes, ...(info.docs || []).map(d => d.text)].filter(Boolean).join("\n"))));
+        // их модель видит в правилах; в чате — только последний набор (не растёт с каждым ответом)
+        const fw = new Set(brokenWords([info.map, info.notes, ...(info.docs || []).map(d => d.text)].filter(Boolean).join("\n")));
+        FOLDER_BROKEN.set(msg, fw);
+        if (fw.size) chat.folderBroken = [...fw].slice(-500); else delete chat.folderBroken;
       }
       catch (e) {
         if (!w) throw new Error(`Папка «${folder.name}» недоступна: ${e.message}. Выберите её заново на странице проекта.`);
@@ -3601,6 +3631,7 @@ function stepExtraHtml(st, k) {
 
 async function undoStep(chat, m, st) {
   if (reverting(chat)) return toast(WAIT_REVERT);
+  REVERTING.add(chat);   // пока отмена идёт, новый ответ ждёт (иначе он начнёт с файлов, которые ещё меняются)
   try {
     await fsApi("undo", { root: st.root || folderOf(chat)?.path, backup: st.undo });
     st.undo = null; st.undone = true; st.undoneAt = Date.now();
@@ -3608,6 +3639,7 @@ async function undoStep(chat, m, st) {
     updateMessage(chat, m);
     toast("Правка отменена");
   } catch (e) { toast(/[а-яё]/i.test(e.message) ? "Не получилось отменить: " + e.message : "Не получилось отменить правку"); }
+  finally { REVERTING.delete(chat); }
 }
 
 // «Откатить все изменения»: отменяем правки ответа с последней к первой — каждая копия хранит файл до своей правки,
@@ -3642,10 +3674,13 @@ async function undoAll(chat, m) {
   const files = new Set(list.map(st => st.path || st.where || st.text)).size;
   if (!confirm(`Вернуть ${plural(files, "файл", "файла", "файлов")} к состоянию до этого ответа? Созданные моделью файлы будут удалены.`)) return;
   let failed = 0;
-  for (const st of list.reverse()) {
-    try { await fsApi("undo", { root: st.root || folderOf(chat)?.path, backup: st.undo }); st.undo = null; st.undone = true; st.undoneAt = Date.now(); }
-    catch { failed++; }
-  }
+  REVERTING.add(chat);
+  try {
+    for (const st of list.reverse()) {
+      try { await fsApi("undo", { root: st.root || folderOf(chat)?.path, backup: st.undo }); st.undo = null; st.undone = true; st.undoneAt = Date.now(); }
+      catch { failed++; }
+    }
+  } finally { REVERTING.delete(chat); }
   persist(chat);
   updateMessage(chat, m);
   toast(failed ? `Откатил не всё: ${plural(failed, "правку", "правки", "правок")} отменить не удалось` : "Все изменения этого ответа отменены");
