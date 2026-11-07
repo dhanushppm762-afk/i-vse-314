@@ -74,6 +74,7 @@ const S = {
   models: { text: [], image: [], inpaint: [] },
   projects: [],       // [{id, name, description, updated, fileCount}]
   projectCache: new Map(),
+  saving: new Map(),   // id чата → сохранения, которые ещё идут
   project: null,      // открытая страница проекта (полный объект) или null
   pending: [],        // прикреплённые, но ещё не отправленные файлы
   stream: null,       // { chat, msg, controller }
@@ -117,7 +118,10 @@ function persist(chat) {
   const fields = { title: chat.title, updated: chat.updated, model: chat.model, projectId: chat.projectId || null };
   if (meta) Object.assign(meta, fields);
   else S.chats.unshift({ id: chat.id, created: chat.created, ...fields });
-  api.save(chat).catch(() => toast("Не удалось сохранить чат"));
+  const pending = S.saving.get(chat.id) || new Set();
+  const saving = api.save(chat).catch(() => { if (!chat.deleted) toast("Не удалось сохранить чат"); })
+    .finally(() => { pending.delete(saving); if (!pending.size && S.saving.get(chat.id) === pending) S.saving.delete(chat.id); });
+  pending.add(saving); S.saving.set(chat.id, pending);
   renderList();
   renderProjects();
 }
@@ -252,6 +256,7 @@ $("#chatList").addEventListener("click", async e => {
     if (!confirm(`Удалить чат «${meta?.title || "Новый чат"}»?`)) return;
     const gone = S.cache.get(id); if (gone) gone.deleted = true;   // до «Стоп»: иначе ответ, завершаясь, сохранит чат заново
     S.streams.get(id)?.controller.abort();
+    await Promise.all([...(S.saving.get(id) || [])]);   // сохранение, которое уже идёт, пришло бы после удаления
     await api.remove(id);
     S.chats = S.chats.filter(c => c.id !== id);
     S.cache.delete(id);
@@ -657,6 +662,7 @@ async function retry() {
 
 // Отвечаем тем способом, каким было задано последнее сообщение (чат или картинка)
 async function respond(chat) {
+  if (chat.deleted) return;   // чат удалили, пока откатывались правки
   const last = [...chat.messages].reverse().find(m => m.role === "user");
   if (OP_LABEL[last?.mode]) return runImage(chat);
   if (chat.projectId) await loadProject(chat.projectId);
@@ -1164,7 +1170,7 @@ async function runCompletion(chat) {
 // Краткое содержание чата проекта — его видят другие чаты того же проекта. Обновляется в фоне,
 // когда в чате прибавилось сообщений, и стоит копейки (короткий запрос без размышлений).
 async function updateDigest(chat) {
-  if (S.settings.projectDigests === false || !chat?.projectId || chat.messages.length < 4 || chat.messages.length - (chat.digestAt || 0) < 4) return;
+  if (S.settings.projectDigests === false || !chat?.projectId || chat.deleted || chat.messages.length < 4 || chat.messages.length - (chat.digestAt || 0) < 4) return;
   chat.digestAt = chat.messages.length;
   const clip = (t, n) => t.length > n ? t.slice(0, n) + "…" : t;
   const lines = chat.messages.slice(-12).filter(m => m.role === "user" || splitThink(m).content).map(m =>
@@ -1180,7 +1186,7 @@ async function updateDigest(chat) {
     if (j.usage) logUsage({ kind: "text", model: chat.model, inTok: j.usage.prompt_tokens || 0, outTok: j.usage.completion_tokens || 0,
       usd: j.cost?.usd ?? textCost(chat.model, j.usage.prompt_tokens || 0, j.usage.completion_tokens || 0), note: "digest" });
     const text = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content.trim().replace(/\s+/g, " ").slice(0, 600);
-    if (!text) return;
+    if (!text || chat.deleted) return;
     const p = await api.getProject(chat.projectId);
     p.digests = { ...(p.digests || {}), [chat.id]: { title: chat.title || "Чат", text, updated: Date.now() } };
     await api.saveProject(p);
@@ -1823,9 +1829,10 @@ const workRootOf = chat => activeArchive(chat) && findModel("text", chat.model)?
 function supersededArchives(chat) {
   const active = activeArchive(chat), out = new Set();
   if (!active) return out;
-  for (const m of chat.messages) for (const f of m.files || []) {
-    if (f.archive === active) return out;
-    if (f.archive?.readOnly && !f.archive.work && f.archive.name === active.name) out.add(f.archive);
+  for (const m of chat.messages) {
+    const files = m.files || [];
+    if (files.some(f => f.archive === active)) return out;   // архив с тем же именем в том же сообщении — другой, не прежняя версия
+    for (const f of files) if (f.archive?.readOnly && !f.archive.work && f.archive.name === active.name) out.add(f.archive);
   }
   return out;
 }
@@ -1833,7 +1840,7 @@ const workContext = chat => { const root = workRootOf(chat); return root ? { roo
 const markTouched = chat => { const a = activeArchive(chat); if (a) a.work.touched = true; };
 
 // байты файла → текст, как его читает сервер: UTF-8, а если это не он — windows-1251
-const bytesText = b => { try { return new TextDecoder("utf-8", { fatal: true }).decode(b); } catch { return new TextDecoder("windows-1251").decode(b); } };
+const bytesText = b => { try { return new TextDecoder("utf-8", { fatal: true }).decode(b); } catch { return new TextDecoder("windows-1251").decode(b).replace(/\u0098/g, "\uFFFD"); } };
 async function fsRaw(body, signal) {
   const res = await fetch("/api/fs/get", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
   if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `Ошибка ${res.status}`);
@@ -1881,35 +1888,51 @@ async function prepareWorkCopy(chat, msg, signal) {
   const users = chat.messages.filter(m => m.role === "user");
   const lastUser = users[users.length - 1];
   const note = text => { msg.steps.push({ status: "note", text }); scheduleUpdate(chat, msg); };
-  const cands = [];
+  const oneAtATime = (b, act) => `править можно один архив за раз — сейчас это ${act.name === b.name ? `другой архив с тем же именем («${act.name}»)` : `«${act.name}»`}`;
+  const cands = [], temp = [];
   for (const m of users) for (const f of m.files || []) {
     const a = f.archive;
-    // причина «только читать» могла пройти: папку от чата отключили, другую копию убрали,
+    if (!a || a.work) continue;
+    // «один архив за раз»: та копия ушла, но в работе другая — причина прежняя, называем ту, что в работе
+    // (иначе старый архив мог бы перехватить правку у более нового)
+    if (a.roOther && !workArchive(chat, a.roOther) && current?.work) { a.readOnly = oneAtATime(a, current); a.roOther = current.path; }
+    // причина «только читать» могла пройти: папку от чата отключили, другую копию убрали, заново присланный архив убрали,
     // распаковка сорвалась (пробуем ещё раз, но только один)
-    if (a && ((a.roFolder && a.roFolder !== current?.path) || a.roTemp || a.roFail || (a.roOther && !workArchive(chat, a.roOther)))) {
-      delete a.readOnly; delete a.roFolder; delete a.roTemp; delete a.roFail; delete a.roOther;
+    if ((a.roFolder && a.roFolder !== current?.path) || a.roTemp || a.roFail || a.roResent || (a.roOther && !workArchive(chat, a.roOther))) {
+      delete a.readOnly; delete a.roFolder; delete a.roTemp; delete a.roFail; delete a.roResent; delete a.roOther;
     }
-    if (!a || a.work || a.readOnly) continue;
+    if (a.readOnly) continue;
     const code = a.tree.filter(t => AW.CODE_FILE.test(t[0])).length;
+    if (!code && !a.tree.some(t => t[2] === "inline" || t[2] === "read")) continue;   // ни кода, ни текстов (картинки) — править нечего
     // архив без кода (тексты) распаковываем, только когда его просят править и другой копии в работе нет;
-    // пока в работе другая копия, модель должна знать, что этот архив только читается (иначе «исправит» его файл в чужой копии)
-    if (!code && current?.work) {
-      a.readOnly = `сейчас ИИ правит ${current.name === a.name ? `другой архив с тем же именем («${a.name}»)` : `архив «${current.name}»`}; чтобы править этот, его нужно прислать в новом чате`;
-      a.roTemp = true;
-      if (m === lastUser && EDIT_ASK.test(lastUser.content || "")) note(`Архив «${a.name}» ИИ только читает: ${a.readOnly}`);
-      continue;
-    }
-    if (!code && (!EDIT_ASK.test(lastUser?.content || "") || !a.tree.some(t => t[2] === "inline" || t[2] === "read"))) continue;
+    // пока в работе другая копия, модель должна знать, что этот архив только читается (иначе «исправит» его файл в чужой копии);
+    // причину пишем в конце: копия может смениться в этом же запросе
+    if (!code && current?.work) { temp.push({ a, m }); continue; }
+    if (!code && !EDIT_ASK.test(lastUser?.content || "")) continue;
     if (!ZIP_SRC.has(a)) {
       a.readOnly = a.noEdit || (a.size > AW.LIMITS.zip ? `архив ${Math.round(a.size / 2 ** 20)} МБ — править можно до ${AW.LIMITS.zip / 2 ** 20} МБ`
         : "после перезапуска приложения его нужно прислать ещё раз");
-      // тот же архив уже прислали заново — про старый не пишем: править будут новый
+      // тот же архив уже прислали заново — про старый не пишем: править будут новый (а если новый уберут — напишем)
       const resent = users.slice(users.indexOf(m) + 1).some(u => (u.files || []).some(g => g.archive?.name === a.name && ZIP_SRC.has(g.archive)));
-      if (!resent) note(`Архив «${a.name}» ИИ только читает: ${a.readOnly}`);
+      if (!resent) note(`Архив «${a.name}» ИИ только читает: ${a.readOnly}`); else a.roResent = true;
       continue;
     }
     cands.push({ a, m, code });
   }
+  try {
+    await unpackOne(chat, msg, signal, cands, current, note, oneAtATime);
+  } finally {
+    const act = activeArchive(chat);
+    if (act) for (const { a, m } of temp) {
+      a.readOnly = `сейчас ИИ правит ${act.name === a.name ? `другой архив с тем же именем («${a.name}»)` : `архив «${act.name}»`}; чтобы править этот, его нужно прислать в новом чате`;
+      a.roTemp = true;
+      if (m === lastUser && EDIT_ASK.test(lastUser.content || "") && !signal?.aborted) note(`Архив «${a.name}» ИИ только читает: ${a.readOnly}`);
+    }
+  }
+}
+
+// из кандидатов распаковываем один архив — из последнего сообщения с архивами, где больше кода; не открылся или велик — следующий
+async function unpackOne(chat, msg, signal, cands, current, note, oneAtATime) {
   if (!cands.length) return;
   if (current && !current.work) {   // своя папка у чата или папка проекта — архив только читаем
     for (const { a } of cands) {
@@ -1918,7 +1941,6 @@ async function prepareWorkCopy(chat, msg, signal) {
     }
     return;
   }
-  // правим один архив — из последнего сообщения с архивами, где больше кода; не открылся или велик — берём следующий
   const last = cands[cands.length - 1].m;
   const step = { status: "run", text: "" };
   msg.steps.push(step);
@@ -1949,11 +1971,15 @@ async function prepareWorkCopy(chat, msg, signal) {
       (plan.deps.length ? `; не распакованы ${plan.deps.join(", ")} — в готовом архиве они останутся как были` : "") +
       (nb ? `; ${plural(nb, "большой файл", "больших файла", "больших файлов")} (больше 50 МБ) ${one(nb) ? "не распакован — останется как был" : "не распакованы — останутся как были"}` : "") +
       (nl ? `; ${plural(nl, "файл", "файла", "файлов")} со слишком длинным путём ${one(nl) ? "не распакован — останется как был" : "не распакованы — останутся как были"}` : "");
-    // остальные архивы — только читаем (если распаковать не вышло, в следующий раз они снова в очереди)
-    // (тот же архив, присланный ещё раз, без пометки: модель знает его как прежнюю версию)
-    for (const c of cands) if (c.a !== a && !c.a.readOnly) {
-      c.a.readOnly = `править можно один архив за раз — сейчас это «${a.name}»`; c.a.roOther = made.root;
-      if (c.a.name !== a.name) note(`Архив «${c.a.name}» ИИ только читает: ${c.a.readOnly}`);
+    // остальные архивы — только читаем (если распаковать не вышло, в следующий раз они снова в очереди);
+    // у тех, что уже ждут своей очереди, — имя новой копии
+    for (const m of chat.messages) for (const f of m.files || []) {
+      const b = f.archive, c = cands.find(c => c.a === b);
+      if (!b || b === a || b.work || !((c && !b.readOnly) || b.roOther)) continue;
+      const first = c && !b.readOnly;
+      b.readOnly = oneAtATime(b, a); b.roOther = made.root;
+      // тот же архив, присланный раньше ещё раз, — без пометки: модель знает его как прежнюю версию
+      if (first && (b.name !== a.name || c.m === last)) note(`Архив «${b.name}» ИИ только читает: ${b.readOnly}`);
     }
     persist(chat);
     if (S.chat === chat) { renderPending(); renderThread(); }   // пометка «ИИ правит копию» — уже на новом архиве
@@ -2019,21 +2045,35 @@ async function revertDropped(chat, dropped) {
   // правки после неё откатываем как обычно.
   // Что поменяли команды того же ответа, откатывается вместе с правками (копия файла — до первой правки).
   const key = st => st.root + "\n" + String(st.path).normalize("NFC").toLowerCase();
+  // время правки; у шагов из сборок без step.at — их порядок в чате, раньше любого настоящего времени
+  const order = new Map([...chat.messages, ...dropped].flatMap(m => m.steps || []).map((st, i) => [st, i]));
+  const at = st => st.at ?? (order.get(st) ?? 0) - 1e13;
   const first = new Map();
-  for (const st of steps) first.set(key(st), Math.min(first.get(key(st)) ?? Infinity, st.at ?? Infinity));
+  for (const st of steps) first.set(key(st), Math.min(first.get(key(st)) ?? Infinity, at(st)));
   const keepBefore = new Map();
   for (const m of [...chat.messages, ...dropped]) for (const st of m.steps || []) {
     const t = st.path && st.undoneAt ? first.get(key(st)) : undefined;
-    if (t !== undefined && st.undoneAt > t && (st.at ?? 0) < t) keepBefore.set(key(st), Math.max(keepBefore.get(key(st)) ?? 0, st.undoneAt));
+    if (t !== undefined && st.undoneAt > t && at(st) < t) keepBefore.set(key(st), Math.max(keepBefore.get(key(st)) ?? -Infinity, st.undoneAt));
   }
-  const skip = st => (st.at ?? 0) < (keepBefore.get(key(st)) ?? 0);
-  let failed = 0, done = 0;
+  const skip = st => at(st) < (keepBefore.get(key(st)) ?? -Infinity);
+  // неудачи — по файлам: если потом удалось отменить более раннюю правку того же файла, файл вернулся целиком
+  const failedIn = new Map(), gone = new Set();
+  let done = 0;
   for (const st of [...steps].reverse()) {
     if (skip(st)) continue;
-    try { await fsApi("undo", { root: st.root, backup: st.undo }); st.undo = null; st.undone = true; st.undoneAt = Date.now(); done++; } catch { failed++; }
+    try {
+      await fsApi("undo", { root: st.root, backup: st.undo });
+      st.undo = null; st.undone = true; st.undoneAt = Date.now(); done++; failedIn.delete(key(st)); gone.delete(key(st));
+    } catch (e) {
+      failedIn.set(key(st), (failedIn.get(key(st)) || 0) + 1);
+      if (/копии архива больше нет/i.test(e.message)) gone.add(key(st));
+    }
   }
+  if (chat.deleted) return;   // чат удалили, пока шёл откат
+  const failed = [...failedIn.values()].reduce((x, n) => x + n, 0);
   const of = dropped.filter(m => ran(m) || (m.steps || []).some(st => steps.includes(st))).length > 1 ? "убранных ответов" : "прошлого ответа";
   if (!steps.length) return toast(`То, что изменили команды ${of}, осталось в копии`, 5000);
+  if (!done && failed && gone.size === failedIn.size) return toast(`Не удалось отменить правки ${of}: рабочей копии архива больше нет на диске`, 6000);
   const kept = new Set(steps.map(key).filter(k => steps.every(st => key(st) !== k || skip(st)))).size;
   const notes = [
     kept && (kept === 1 ? "файл, где вы уже отменили более раннюю правку, оставлен как есть" : "файлы, где вы уже отменили более ранние правки, оставлены как есть"),
@@ -2041,7 +2081,7 @@ async function revertDropped(chat, dropped) {
     cmds && "то, что изменили команды, могло остаться в копии",   // в других файлах или до первой правки
   ].filter(Boolean);
   if (done) toast(notes.length ? `Правки ${of} отменены, но ${notes.join("; ")}` : `Правки ${of} отменены — ИИ начнёт с тех же файлов`, notes.length ? 6000 : 2200);
-  else if (failed) toast(`Не удалось отменить правки ${of}` + (notes.length ? `; ${notes.join("; ")}` : ": файлы остались изменёнными"), 6000);
+  else if (failed) toast(`Не удалось отменить правки ${of}` + (notes.length ? `; ${notes.join("; ")}` : failedIn.size > 1 ? ": файлы остались изменёнными" : ": файл остался изменённым"), 6000);
   else toast(notes.join("; ").replace(/^./, c => c.toUpperCase()), 6000);   // всё оставлено как есть
 }
 function dropOrphanCopies(chat, dropped) {   // копии архивов из убранных сообщений больше не нужны
@@ -2064,9 +2104,9 @@ function agentSetup(chat, useBrowser) {
   return { folder, w, archives, tools };
 }
 function archivesForTool(chat, name, args) {   // из активного архива — только картинки, PDF и DOCX (исходные версии)
-  const active = activeArchive(chat);
+  const active = activeArchive(chat), old = active ? supersededArchives(chat) : new Set();
   const media = name === "archive_view_image" || (name === "archive_read" && /\.(pdf|docx)$/i.test(String(args.path || "")));
-  return archivesFor(chat).filter(a => a !== active || media);
+  return archivesFor(chat).filter(a => (a !== active || media) && !old.has(a));   // прежние версии активного — тоже нет
 }
 
 // Карточка «Скачать готовый архив»: у активной копии — под последним ответом, у прежних — под последним ответом, который их менял
@@ -2096,6 +2136,12 @@ const ARCHIVE_TOOLS = [
 ].map(f => ({ type: "function", function: f }));
 const ARCHIVE_CHUNK = 60_000;
 
+// почему архив только читается; архивы из файлов проекта ИИ не распаковывает — пока он работает с папкой
+// (копией архива или папкой проекта), им нужна пометка, иначе модель «исправит» их файл в этой папке
+function readOnlyWhy(chat, folder) {
+  const proj = new Set((chat.projectId && S.projectCache.get(chat.projectId)?.files || []).map(f => f.archive).filter(Boolean));
+  return a => !a.work && (a.readOnly || (folder && proj.has(a) ? "архив из файлов проекта — ИИ его только читает" : ""));
+}
 function archivesFor(chat) {
   const list = [];
   for (const m of chat.messages) for (const f of m.files || []) if (f.archive) list.push(f.archive);
@@ -2189,12 +2235,12 @@ function archiveTool(name, args, list) {
   return { label: `Неизвестный инструмент ${name}`, error: true, text: "Нет такого инструмента" };
 }
 
-const archiveRules = list => `К разговору приложены архивы: ${list.map(a => `«${a.name}» (${a.tree.filter(t => t[2] === "inline" || t[2] === "read").length} текстовых файлов)`).join(", ")}.
+const archiveRules = (list, why = a => !a.work && a.readOnly) => `К разговору приложены архивы: ${list.map(a => `«${a.name}» (${a.tree.filter(t => t[2] === "inline" || t[2] === "read").length} текстовых файлов)`).join(", ")}.
 Часть файлов уже вставлена в сообщения (пометка «✓ ниже»), остальные открывай инструментом archive_read — ты можешь прочитать любой файл из любой папки. Список файлов — archive_list, поиск по всем файлам — archive_search.
 Если задача касается всего проекта или сайта — сначала посмотри дерево файлов и прочитай все нужные файлы, а не угадывай их содержимое. Не говори, что не видишь файл, пока не попробовал archive_read.
 Картинки архива (логотипы, фоны, иконки) смотри инструментом archive_view_image — только те, что нужны для задачи.
 Экономь шаги: ищи через archive_search, затем открывай нужное место через archive_read с line. Нашёл ответ — сразу отвечай, без повторных перепроверок одного и того же.${(ro => ro.length ? `
-Только для чтения: ${ro.map(a => `«${a.name}» (${a.readOnly})`).join(", ")}. Если просят исправить их файлы — покажи исправления в ответе (какой файл и что поменять) и коротко объясни, почему готовый архив здесь не собрать.` : "")(list.filter(a => a.readOnly && !a.work))}`;
+Только для чтения: ${ro.map(a => `«${a.name}» (${why(a)})`).join(", ")}. Если просят исправить их файлы — покажи исправления в ответе (какой файл и что поменять) и коротко объясни, почему готовый архив здесь не собрать.` : "")(list.filter(why))}`;
 
 const AGENT_RULES = `Тебе доступен встроенный браузер пользователя (инструменты browser_*).
 Когда пользоваться: прочитать конкретную страницу целиком, посмотреть, как выглядит сайт, или сделать что-то на сайте по просьбе пользователя. Для быстрых фактов хватает web_search. На обычные вопросы отвечай сразу, без браузера.
@@ -2265,7 +2311,7 @@ async function runTool(call, chat, msg) {
   const done = (status, text, result) => { step.status = status; if (text) step.text = text; scheduleUpdate(chat, msg); return result; };
   const failed = r => r?.error || r?.loadError;
   // Venice испортил буквы внутри вызова — не выполняем (иначе «�» попадут в файл), просим повторить
-  if (BROKEN.test(JSON.stringify(args)) && brokenArgs(call.name, args, knownBroken(chat, msg)) && (msg.brokenRetries = (msg.brokenRetries || 0) + 1) <= BROKEN_RETRIES)
+  if (BROKEN.test(JSON.stringify(args)) && brokenArgs(call.name, args, knownBroken(chat, msg), userBroken(chat)) && (msg.brokenRetries = (msg.brokenRetries || 0) + 1) <= BROKEN_RETRIES)
     return done("note", BROKEN_NOTE, { text: BROKEN_TEXT });
   if (call.name === "remember_user") {
     const ok = rememberUser(args.note);
@@ -2484,25 +2530,58 @@ const editList = a => Array.isArray(a?.edits) && a.edits.length ? a.edits : [{ o
 const brokenWords = t => String(t ?? "").replace(/\\[a-zA-Z]/g, " ").match(/[\p{L}\p{N}\uFFFD]*\uFFFD[\p{L}\p{N}\uFFFD]*/gu) || [];
 // все строки в аргументах вызова, как есть (в JSON перевод строки стал бы «\n» и прилип к слову)
 const argStrings = v => typeof v === "string" ? [v] : v && typeof v === "object" ? Object.values(v).flatMap(argStrings) : [];
-const BROKEN_SEEN = new WeakMap();   // ответ → «�»-слова из файлов и выводов команд, которые ИИ видел в этом ответе
-// Настоящие «�» (файл когда-то сохранили не в той кодировке) уже есть у пользователя, в его вложениях
+// Настоящие «�» (файл когда-то сохранили не в той кодировке) уже есть у пользователя, в его вложениях, в проекте
 // или в прочитанных файлах — их можно искать и цитировать. Сбой Venice даёт новые слова с «�», которых там нет.
-function knownBroken(chat, msg) {
-  const known = new Set(BROKEN_SEEN.get(msg));
-  for (const m of chat.messages || []) {
-    for (const w of BROKEN_SEEN.get(m) || []) known.add(w);
-    if (m.role !== "user") continue;
-    for (const t of [m.content, ...(m.files || []).filter(f => f.kind === "text").map(f => f.data)]) for (const w of brokenWords(t)) known.add(w);
-  }
+function userBroken(chat) {   // слова самого пользователя: сообщения, вложения, описание, инструкции и файлы проекта
+  const out = new Set();
+  const add = t => { if (typeof t === "string") for (const w of brokenWords(t)) out.add(w); };
+  for (const m of chat.messages || []) if (m.role === "user") { add(m.content); for (const f of m.files || []) if (f.kind === "text") add(f.data); }
+  const p = chat.projectId && S.projectCache.get(chat.projectId);
+  if (p) { add(p.description); add(p.instructions); for (const f of p.files || []) add(f.data); }
+  return out;
+}
+function knownBroken(chat, msg) {   // и слова из файлов и выводов команд, которые ИИ видел в этом чате (msg.seenBroken)
+  const known = userBroken(chat);
+  for (const m of new Set([...(chat.messages || []), msg])) for (const w of m?.seenBroken || []) known.add(w);
   return known;
+}
+// запомнить «�»-слова, которые ИИ увидел в файлах и выводе команд, — в самом ответе (сохраняется с чатом, переживает
+// перезапуск); кроме тех, что ИИ сам написал в вызове: их повторяют ошибки и отказы
+function addSeen(msg, text, own = "") {
+  const words = brokenWords(text).filter(w => !own.includes(w));
+  if (words.length) msg.seenBroken = [...new Set([...(msg.seenBroken || []), ...words])].slice(0, 500);
 }
 // инструменты, которые показывают модели файлы и вывод программ (отчёт разведчика написан моделью — его Venice тоже может испортить)
 const SEES_FILES = name => READ_ONLY_TOOLS.has(name) || name.startsWith("archive_") || ["run_command", "command_status"].includes(name);
-function brokenArgs(name, a, known = new Set()) {
-  const fresh = (t, also = "") => brokenWords(t).some(w => !known.has(w) && !also.includes(w));
-  if (name === "edit_file") return fresh(a.path) || editList(a).some(e => fresh(e?.new, String(e?.old ?? "")));
-  if (name === "write_file") return fresh(a.path);   // текст файла сверяется с прежним в fsTool
+// инструменты, которые только смотрят: ошибка в них ничего не портит
+const QUIET_TOOL = name => PARALLEL_TOOLS.has(name) || ["web_search", "command_status", "browser_open", "browser_read", "browser_screenshot"].includes(name);
+// слово только из «�»: так выглядит испорченная буква-слово («��» — «в», «с», «и») или тире («���»)
+const pureBroken = w => /^\uFFFD+$/.test(w);
+const countWords = t => { const n = new Map(); for (const w of brokenWords(t)) n.set(w, (n.get(w) || 0) + 1); return n; };
+// новые «�»-слова текста t: их нет среди настоящих (known) и в заменяемом тексте (had); слова сравниваются целиком.
+// Слово только из «�» в правках и командах (strict) годится, если оно есть у самого пользователя (user) или в заменяемом
+// тексте не реже: файл с кракозябрами, который ИИ прочитал, не делает «��» настоящим во всех правках
+function freshBroken(t, { known, user = known, had = "", strict = false }) {
+  const old = countWords(had);
+  return [...countWords(t)].filter(([w, n]) => strict && pureBroken(w) ? !user.has(w) && n > (old.get(w) || 0) : !known.has(w) && !old.has(w)).map(([w]) => w);
+}
+function brokenArgs(name, a, known = new Set(), user = known) {
+  const strict = !QUIET_TOOL(name);
+  const fresh = (t, had = "", st = strict) => freshBroken(t, { known, user, had, strict: st }).length > 0;
+  if (name === "edit_file") return fresh(a.path, "", false) || editList(a).some(e => fresh(e?.new, String(e?.old ?? "")));
+  if (name === "write_file") return fresh(a.path, "", false);   // текст файла сверяется с прежним в fsTool
   return fresh(argStrings(a).join("\n"));
+}
+// слова, которых нет во всём файле: поиск сервера (та же кодировка, что у read_file; слово целиком) — для файла,
+// прочитанного не целиком; не вышло спросить — считаем, что слово есть (лучше пропустить, чем отказать зря)
+async function missingIn(root, path, words) {
+  const out = [];
+  for (const w of words.slice(0, 12)) {
+    const query = `(?<![^\\W_])(?<!\uFFFD)${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![^\\W_])(?!\uFFFD)`;
+    const r = await fsApi("grep", { root, path, query, regex: true, ignore_case: false, limit: 1 }).catch(() => null);
+    if (r && !r.total) out.push(w);
+  }
+  return out;
 }
 // испорченное слово годится в замену, только если всё остальное в нём совпало, а вместо «�» стоят 1–2 символа
 function brokenFixOk(word, fix) {
@@ -2511,13 +2590,16 @@ function brokenFixOk(word, fix) {
   return new RegExp(`^${re}$`, "u").test(fix);
 }
 async function repairBroken(chat, msg, controller) {
-  const text = msg.content || "";
-  if (!BROKEN.test(text)) return null;
+  // ответ и слова модели между шагами (их пользователь видит в шагах)
+  const notes = (msg.steps || []).filter(st => st.say && BROKEN.test(st.text || ""));
+  const texts = [msg.content || "", ...notes.map(st => st.text)].filter(t => BROKEN.test(t));
+  if (!texts.length) return null;
   const known = knownBroken(chat, msg);   // настоящие «�» ответ просто цитирует — их не трогаем
-  const words = [...new Set(text.match(/\S*\uFFFD+\S*/g))].filter(w => !brokenWords(w).every(x => known.has(x))).slice(0, 20);
+  const tokens = t => t.match(/\S*\uFFFD+\S*/g) || [];   // испорченные места — целые куски между пробелами
+  const words = [...new Set(texts.flatMap(tokens))].filter(w => !brokenWords(w).every(x => known.has(x))).slice(0, 20);
   if (!words.length) return null;
   const list = words.map((w, i) => {
-    const at = text.indexOf(w);
+    const text = texts.find(t => tokens(t).includes(w)), at = text.indexOf(w);
     return `${i + 1}. ${w}\n   в тексте: …${text.slice(Math.max(0, at - 90), at)}⟦${w}⟧${text.slice(at + w.length, at + w.length + 90)}…`;
   });
   try {
@@ -2530,11 +2612,14 @@ async function repairBroken(chat, msg, controller) {
     const out = splitThink({ content: j.choices?.[0]?.message?.content || "" }).content;
     let fixes = [];
     try { fixes = JSON.parse(out.match(/\[[\s\S]*\]/)?.[0] || "[]"); } catch {}
-    let fixed = text;
-    // сначала длинные: короткий кусок может входить в длинный
-    words.map((w, i) => [w, fixes[i]]).sort((x, y) => y[0].length - x[0].length)
-      .forEach(([w, f]) => { if (brokenFixOk(w, f)) fixed = fixed.split(w).join(f); });
-    if (fixed !== text) { msg.content = fixed; scheduleUpdate(chat, msg); }
+    // меняем только целые куски: «��» внутри настоящего слова («Ст��рый») не трогаем
+    const map = new Map(words.map((w, i) => [w, fixes[i]]).filter(([w, f]) => brokenFixOk(w, f)));
+    const fix = t => t.split(/(\s+)/).map(x => map.get(x) ?? x).join("");
+    let changed = false;
+    const content = fix(msg.content || "");
+    if (content !== (msg.content || "")) { msg.content = content; changed = true; }
+    for (const st of notes) { const t = fix(st.text); if (t !== st.text) { st.text = t; changed = true; } }
+    if (changed) scheduleUpdate(chat, msg);
     return { in: j.usage?.prompt_tokens || 0, out: j.usage?.completion_tokens || 0, usd: j.cost?.usd ?? null };
   } catch (e) {
     if (e.name === "AbortError") throw e;
@@ -2670,20 +2755,23 @@ async function runAgent(chat) {
         info = await fsApi("info", { root: folder.path });
         const map = await codeMap(folder.path, w?.codeDir, 16_000);
         if (map?.map) { info.map = map.map; info.mapTruncated = map.truncated; }
+        addSeen(msg, [info.map, info.notes, ...(info.docs || []).map(d => d.text)].filter(Boolean).join("\n"));   // их модель видит в правилах
       }
       catch (e) {
         if (!w) throw new Error(`Папка «${folder.name}» недоступна: ${e.message}. Выберите её заново на странице проекта.`);
-        const a = activeArchive(chat); if (a) delete a.work;
+        const a = activeArchive(chat), again = !!a && ZIP_SRC.has(a); if (a) delete a.work;
         delete chat.folder;
         if (S.chat === chat) renderPending();
-        msg.steps.push({ status: "note", text: `Рабочая копия архива «${folder.name}» пропала с диска — ИИ только читает архив. Чтобы снова править, прикрепите архив заново` });
+        msg.steps.push({ status: "note", text: `Рабочая копия архива «${folder.name}» пропала с диска — ` + (again
+          ? "в этом ответе ИИ только читает архив. В следующем он распакует его заново: с исходными файлами, без прежних правок"
+          : "ИИ только читает архив. Чтобы снова править, прикрепите архив заново") });
         ({ folder, w, archives, tools } = agentSetup(chat, useBrowser));
       }
     }
     const system = [await systemPrompt(chat),
       info ? folderRules(folder, info, useBrowser, w) : "",
       WEB_RULES,
-      archives.length ? archiveRules(archives) : "",
+      archives.length ? archiveRules(archives, readOnlyWhy(chat, folder)) : "",
       useBrowser ? AGENT_RULES : "",
       useBrowser ? (page.url ? `Сейчас в браузере открыто: ${page.url} — «${page.title || ""}».` : "Браузер пока пуст.") : ""].filter(Boolean).join("\n\n");
     // переписка до задачи занимает не больше трети памяти (с папкой) — остальное нужно для работы
@@ -2730,7 +2818,7 @@ async function runAgent(chat) {
         break;
       }
       // промежуточные пояснения модели («сейчас открою…») — в список шагов, в ответе останется только итог
-      if (turn.content.trim()) msg.steps.push({ status: "note", text: shortText(turn.content.trim(), 160) });
+      if (turn.content.trim()) msg.steps.push({ status: "note", say: true, text: shortText(turn.content.trim(), 160) });   // say — слова модели (их тоже чинит repairBroken)
       msg.content = "";
       convo.push({ role: "assistant", content: turn.content || "", ...thoughtOf(turn), tool_calls: turn.calls.map(c => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })) });
       // чтения и поиски — одновременно; всё, что меняет файлы или браузер, — по очереди
@@ -2747,11 +2835,7 @@ async function runAgent(chat) {
         let ca = {};
         try { ca = JSON.parse(call.args || "{}"); } catch {}
         // «�»-слова из файлов и вывода команд — настоящие; кроме тех, что ИИ сам написал в вызове (их повторяют ошибки и отказы)
-        if (SEES_FILES(call.name) && result.text !== BROKEN_TEXT && BROKEN.test(result.text || "")) {
-          const own = argStrings(ca).join("\n");
-          const words = brokenWords(result.text).filter(w => !own.includes(w));
-          if (words.length) BROKEN_SEEN.set(msg, new Set([...(BROKEN_SEEN.get(msg) || []), ...words]));
-        }
+        if (SEES_FILES(call.name) && result.text !== BROKEN_TEXT && BROKEN.test(result.text || "")) addSeen(msg, result.text, argStrings(ca).join("\n"));
         for (const f of fileTargets(call.name, ca)) {
           const n = (pieces.get(f) || 0) + 1;
           pieces.set(f, n);
@@ -3103,11 +3187,13 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
         text: r.total ? `Найдено ${r.total}${r.total > rows.length ? `, показаны первые ${rows.length} — уточни pattern или dir` : ""}:\n${rows.join("\n")}` : "Таких файлов нет." };
     }
     case "grep": {
+      step.text = `Ищу «${shortText(args.query, 40)}»`;
       const r = await fsApi("grep", { root, ...args });
       return { status: "ok", label: `Ищу «${shortText(args.query, 40)}»${args.glob ? ` в ${args.glob}` : ""} — ${r.total ? plural(r.total, "совпадение", "совпадения", "совпадений") : "нет"}`,
         text: r.total ? `Найдено ${r.total} в ${plural(r.files, "файле", "файлах", "файлах")}${r.total > r.lines.length ? ` (показаны первые; сузь поиск через glob/path)` : ""}:\n${r.lines.join("\n")}` : `«${args.query}» не найдено.` };
     }
     case "read_file": {
+      step.text = `Читаю ${shortPath(args.path)}`;
       const r = await fsApi("read", { root, path: args.path, offset: args.offset, limit: args.limit });
       if (!sub) readsOf(chat).set(r.path, r.version);   // помощник-разведчик читает для себя, не для главной модели
       const more = r.to < r.total ? `\n…[показаны строки ${r.from}–${r.to} из ${r.total}; дальше — read_file с offset=${r.to + 1}]` : "";
@@ -3156,10 +3242,14 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
       } catch {}
       // в тексте новые слова с «�», которых не было ни в файле, ни у пользователя, — Venice испортил буквы: не пишем, просим повторить
       if (BROKEN.test(String(args.content ?? "")) && (msg.brokenRetries || 0) < BROKEN_RETRIES) {
-        const known = knownBroken(chat, msg);
-        // прочитан не весь файл — сверяем с целым (у копии архива его можно взять), иначе не проверяем
-        const whole = !cut ? old ?? "" : folder.work ? await fsRaw({ root, path: oldPath }).then(bytesText).catch(() => null) : null;
-        if (whole != null && brokenWords(args.content).some(w => !known.has(w) && !whole.includes(w))) {
+        const opts = { known: knownBroken(chat, msg), user: userBroken(chat), strict: true };
+        let fresh = freshBroken(args.content, { ...opts, had: old ?? "" });
+        // прочитан не весь файл: у копии архива сверяем с целым файлом, в обычной папке — ищем слова поиском по файлу
+        if (fresh.length && cut) {
+          const whole = folder.work ? await fsRaw({ root, path: oldPath }).then(bytesText).catch(() => null) : null;
+          fresh = whole != null ? freshBroken(args.content, { ...opts, had: whole }) : await missingIn(root, oldPath, fresh);
+        }
+        if (fresh.length) {
           msg.brokenRetries = (msg.brokenRetries || 0) + 1;
           return { status: "note", label: BROKEN_NOTE, text: BROKEN_TEXT };
         }
@@ -3220,12 +3310,14 @@ async function fsTool(name, args, chat, msg, step, sub = false) {
         text: `Команда «${r.command}» ${state}.\nНовый вывод с прошлой проверки:\n${r.output || "(нет)"}${long}` };
     }
     case "code_map": {
+      step.text = `Смотрю карту кода${args.dir ? ` в ${args.dir}` : ""}`;
       const r = await fsApi("symbols", { root, dir: args.dir, glob: args.glob, maxChars: 60_000 });
       return { status: "ok", label: `Смотрю карту кода${args.dir ? ` в ${args.dir}` : ""} — ${plural(r.files, "файл", "файла", "файлов")}`,
         text: r.map ? `${r.map}${r.truncated ? "\n…[карта обрезана — уточни dir или glob]" : ""}` : "Файлов с кодом не найдено." };
     }
     case "find_symbol": {
       const name = String(args.name || "").trim();
+      step.text = `Ищу «${shortText(name, 40)}» в коде`;
       if (!/^[\w$.:]+$/.test(name)) return { status: "err", label: "Неверное имя", text: "Передай одно имя: функцию, класс или переменную." };
       const e = name.split(/[.:]+/).pop().replace(/\$/g, "\\$");
       // код архива в собранной папке (dist/) обход пропускает — там ищем отдельно
@@ -3389,7 +3481,11 @@ async function runHelper(chat, msg, step, task, { label, maxSteps, system, title
       let a = {};
       try { a = JSON.parse(c.args || "{}"); } catch { return "Ошибка: аргументы — не JSON"; }
       if (!READ_ONLY_TOOLS.has(c.name)) return `Нет инструмента ${c.name}`;
-      try { return (await fsTool(c.name, a, chat, msg, {}, true)).text; } catch (e) { return `Ошибка: ${e.message}`; }
+      try {
+        const text = (await fsTool(c.name, a, chat, msg, {}, true)).text;
+        if (BROKEN.test(text || "")) addSeen(msg, text, argStrings(a).join("\n"));   // файлы, которые читал помощник, — настоящие (его отчёт — нет)
+        return text;
+      } catch (e) { return `Ошибка: ${e.message}`; }
     }));
     turn.calls.forEach((c, k) => convo.push({ role: "tool", tool_call_id: c.id, content: results[k] }));
     steps += turn.calls.length;

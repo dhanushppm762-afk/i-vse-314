@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 SKIP_DIRS = {"node_modules", ".git", ".svn", ".hg", "vendor", ".venv", "venv", "__pycache__", ".pytest_cache",
@@ -24,6 +25,7 @@ WORK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 WORK_SKIP = {"node_modules", ".git", "__pycache__", ".venv", "venv", "Pods", ".gradle", "DerivedData", "jspm_packages"}   # должно быть подмножеством UNPACK_SKIP в archive-work.js
 WORK_MAX_FILES = 100_000
 NOT_WORK = "Это можно только в рабочей копии архива"
+GONE_WORK = "Рабочей копии архива больше нет"
 MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "README.md"]
 MAX_FILE_BYTES = 2 * 1024 * 1024
 # Карта кода: шаблоны объявлений (имя — в группе n); те же, что в Workspace.swift
@@ -67,6 +69,8 @@ class Workspace:
         self.memory_dir = data_dir / "memory"
         self.work_dir = data_dir / "work"
         self.folders_lock = threading.Lock()
+        self.work_lock = threading.Lock()   # запись в копию архива и её удаление — по очереди (иначе запись пересоздаст стёртое)
+        self.dropped_chats = set()           # чаты, удалённые за этот запуск: новых копий для них не создаём
         self.running = {}
         self.jobs = {}
         self.job_count = 0
@@ -93,8 +97,13 @@ class Workspace:
         return p
 
     def forget_tree(self, base):
-        """Копия архива больше не нужна: остановить запущенное в ней, убрать её папки из разрешённых и стереть с диска."""
+        """Копия архива больше не нужна: закрыть доступ к ней, остановить запущенное в ней и стереть с диска."""
         inside = lambda p: p == base or p.startswith(base + "/")
+        with self.work_lock, self.folders_lock:   # сначала доступ: запись, которая придёт позже, получит отказ
+            items = self.allowed()
+            keep = [p for p in items if not inside(p)]
+            if len(keep) != len(items):
+                self.save_folders(keep)
         procs = []
         for job in list(self.jobs.values()):
             if inside(job["root"]) and job["proc"].poll() is None:
@@ -105,12 +114,8 @@ class Workspace:
         for proc in procs:   # иначе команда (сборка, сервер) пересоздаст файлы в стёртой папке
             self.stop_tree(proc)
         self.stop_left(base)
-        with self.folders_lock:
-            items = self.allowed()
-            keep = [p for p in items if p != base and not p.startswith(base + "/")]
-            if len(keep) != len(items):
-                self.save_folders(keep)
-        shutil.rmtree(base, ignore_errors=True)
+        with self.work_lock:   # запись, которая уже шла, закончилась — теперь стираем
+            shutil.rmtree(base, ignore_errors=True)
 
     # ---- рабочие копии архивов ----
     def work_base(self, r):
@@ -129,8 +134,11 @@ class Workspace:
             raise FsError("Неверный id чата")
         name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(body.get("name") or "")).strip(".-")[:60] or "archive"
         base = self.work_dir / chat / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
-        (base / name).mkdir(parents=True)
-        return {"base": self.allow(base), "root": self.allow(base / name)}
+        with self.work_lock:
+            if chat in self.dropped_chats:
+                raise FsError("Чат удалён")
+            (base / name).mkdir(parents=True)
+            return {"base": self.allow(base), "root": self.allow(base / name)}
 
     def put_files(self, r, body):
         self.work_base(r)
@@ -183,6 +191,8 @@ class Workspace:
         """Чат удалён — стираем его рабочие копии архивов."""
         if not WORK_ID.fullmatch(str(chat_id or "")):
             return
+        with self.work_lock:
+            self.dropped_chats.add(chat_id)
         d = self.work_dir / chat_id
         if d.is_symlink():   # ссылку убираем, а не то, куда она ведёт
             d.unlink()
@@ -195,11 +205,24 @@ class Workspace:
         if not r:
             raise FsError("Папка проекта не выбрана")
         p = Path(r).resolve()
+        work = self.work_dir.resolve()
         if str(p) not in self.allowed():
-            raise FsError(f"Нет доступа к папке {r}: подключите её к проекту заново")
+            raise FsError(GONE_WORK if work in p.parents else f"Нет доступа к папке {r}: подключите её к проекту заново")
         if not p.is_dir():
-            raise FsError(f"Папки {r} больше нет")
+            raise FsError(GONE_WORK if work in p.parents else f"Папки {r} больше нет")
         return p
+
+    @contextmanager
+    def writing(self, r):
+        """Запись в копию архива — под замком и только пока копия разрешена: удаление чата не застанет её на полпути."""
+        work = self.work_dir.resolve()
+        if work not in r.parents:
+            yield
+            return
+        with self.work_lock:
+            if str(r) not in self.allowed():
+                raise FsError(GONE_WORK)
+            yield
 
     def resolve(self, root: Path, rel):
         s = str(rel or "").strip()
@@ -294,6 +317,9 @@ class Workspace:
             fn = self.start_job
         if not fn:
             raise FsError(f"Нет такой операции: {op}")
+        if op in ("put", "write", "edit", "undo"):
+            with self.writing(r):
+                return fn(r, body)
         return fn(r, body)
 
     def info(self, r, body):
@@ -485,18 +511,20 @@ class Workspace:
         p = self.resolve(r, meta["path"])
         if meta.get("existed") and not (d / "file").is_file():
             raise FsError("Копия для отмены не найдена")
-        if p.is_dir():
+        if p.is_dir() and not p.is_symlink():
             raise FsError(f"На месте файла {meta['path']} теперь папка")
         try:
             if meta.get("existed"):
                 p.parent.mkdir(parents=True, exist_ok=True)   # папку файла могла переместить или стереть команда
+                if p.is_symlink():   # команда поставила на место файла ссылку — заменяем её, а не пишем туда, куда она ведёт
+                    p.unlink()
                 shutil.copy2(d / "file", p)
             elif p.exists() or p.is_symlink():
                 p.unlink()
         except OSError as e:
             why = {errno.ENOSPC: "на диске нет места", errno.EACCES: "нет прав на запись", errno.EPERM: "нет прав на запись",
                    errno.ENOTDIR: "на месте его папки теперь файл", errno.EEXIST: "на месте его папки теперь файл"}.get(e.errno, "ошибка записи")
-            raise FsError(f"Не удалось вернуть {meta['path']}: {why}")
+            raise FsError(f"Не удалось {'вернуть' if meta.get('existed') else 'удалить'} {meta['path']}: {why}")
         return {"ok": True, "path": meta["path"]}
 
     @staticmethod

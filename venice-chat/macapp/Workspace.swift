@@ -24,6 +24,9 @@ final class Workspace {
     private var memoryDir: URL { dataDir.appendingPathComponent("memory", isDirectory: true) }
     private var workDir: URL { dataDir.appendingPathComponent("work", isDirectory: true) }
     private let foldersLock = NSLock()
+    private let workLock = NSLock()            // запись в копию архива и её удаление — по очереди (иначе запись пересоздаст стёртое)
+    private var droppedChats = Set<String>()   // под workLock: чаты, удалённые за этот запуск, — новых копий для них не создаём
+    private static let goneWork = "Рабочей копии архива больше нет"
     static let workSkip: Set<String> = ["node_modules", ".git", "__pycache__", ".venv", "venv", "Pods", ".gradle", "DerivedData", "jspm_packages"]   // ⊆ UNPACK_SKIP в archive-work.js
     private static let notWork = "Это можно только в рабочей копии архива"
 
@@ -56,10 +59,21 @@ final class Workspace {
     private func root(_ body: [String: Any]) throws -> URL {
         guard let r = body["root"] as? String, !r.isEmpty else { throw FsError("Папка проекта не выбрана") }
         let url = URL(fileURLWithPath: r).resolvingSymlinksInPath()
-        guard allowed.contains(url.path) else { throw FsError("Нет доступа к папке \(r): подключите её к проекту заново") }
+        let inWork = isWork(url)
+        guard allowed.contains(url.path) else { throw FsError(inWork ? Self.goneWork : "Нет доступа к папке \(r): подключите её к проекту заново") }
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { throw FsError("Папки \(r) больше нет") }
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { throw FsError(inWork ? Self.goneWork : "Папки \(r) больше нет") }
         return url
+    }
+
+    private func isWork(_ url: URL) -> Bool { url.path.hasPrefix(workDir.resolvingSymlinksInPath().path + "/") }
+
+    /// Запись в копию архива — под замком и только пока копия разрешена: удаление чата не застанет её на полпути
+    private func guarded(_ r: URL, _ body: () throws -> [String: Any]) throws -> [String: Any] {
+        guard isWork(r) else { return try body() }
+        workLock.lock(); defer { workLock.unlock() }
+        guard allowed.contains(r.path) else { throw FsError(Self.goneWork) }
+        return try body()
     }
 
     /// Путь внутри проекта; выйти за его пределы (../, ссылки) нельзя
@@ -99,14 +113,14 @@ final class Workspace {
                 case "list": out = try list(r, body)
                 case "grep": out = try grep(r, body)
                 case "read": out = try read(r, body)
-                case "write": out = try write(r, body)
-                case "edit": out = try edit(r, body)
-                case "undo": out = try undo(r, body)
+                case "write": out = try guarded(r) { try write(r, body) }
+                case "edit": out = try guarded(r) { try edit(r, body) }
+                case "undo": out = try guarded(r) { try undo(r, body) }
                 case "run": out = body["background"] as? Bool == true ? try startJob(r, body) : try run(r, body, id: id)
                 case "job": out = try jobStatus(r, body)
                 case "memory": out = memory(r, body)
                 case "symbols": out = try symbols(r, body)
-                case "put": out = try putFiles(r, body)
+                case "put": out = try guarded(r) { try putFiles(r, body) }
                 case "files": out = try listAll(r)
                 case "drop": out = try dropWork(r)
                 default: throw FsError("Нет такой операции: \(op)")
@@ -386,25 +400,34 @@ final class Workspace {
               meta["root"] as? String == r.path else { throw FsError("Копия для отмены не найдена") }
         let url = try resolve(r, meta["path"])
         let path = meta["path"] as? String ?? ""
+        let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
         var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue { throw FsError("На месте файла \(path) теперь папка") }
+        if !link, FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue { throw FsError("На месте файла \(path) теперь папка") }
         if meta["existed"] as? Bool == true {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent("file")) else { throw FsError("Копия для отмены не найдена") }
             do {
-                // папку файла могла переместить или стереть команда
+                // папку файла могла переместить или стереть команда; ссылку на месте файла запись заменяет, а не пишет по ней
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try data.write(to: url, options: .atomic)
-            } catch {
-                let e = error as NSError
-                let why = e.code == NSFileWriteOutOfSpaceError ? "на диске нет места"
-                    : e.code == NSFileWriteNoPermissionError ? "нет прав на запись"
-                    : e.code == NSFileWriteFileExistsError ? "на месте его папки теперь файл" : "ошибка записи"
-                throw FsError("Не удалось вернуть \(path): \(why)")
-            }
-        } else {
-            try? FileManager.default.removeItem(at: url)
+            } catch { throw FsError("Не удалось вернуть \(path): \(Self.writeWhy(error))") }
+        } else if link || FileManager.default.fileExists(atPath: url.path) {
+            do { try FileManager.default.removeItem(at: url) }
+            catch { throw FsError("Не удалось удалить \(path): \(Self.writeWhy(error))") }
         }
         return ["ok": true, "path": meta["path"] as? String ?? ""]
+    }
+
+    /// Причина ошибки записи по-русски (как в Python-версии)
+    private static func writeWhy(_ error: Error) -> String {
+        let e = error as NSError
+        var posix = 0
+        if e.domain == NSPOSIXErrorDomain { posix = e.code }
+        else if let u = e.userInfo[NSUnderlyingErrorKey] as? NSError, u.domain == NSPOSIXErrorDomain { posix = u.code }
+        let cocoa = e.domain == NSCocoaErrorDomain ? e.code : -1
+        if cocoa == NSFileWriteOutOfSpaceError || posix == Int(ENOSPC) { return "на диске нет места" }
+        if cocoa == NSFileWriteNoPermissionError || posix == Int(EACCES) || posix == Int(EPERM) { return "нет прав на запись" }
+        if cocoa == NSFileWriteFileExistsError || posix == Int(ENOTDIR) || posix == Int(EEXIST) { return "на месте его папки теперь файл" }
+        return "ошибка записи"
     }
 
     private func run(_ r: URL, _ body: [String: Any], id: ObjectIdentifier) throws -> [String: Any] {
@@ -547,6 +570,7 @@ final class Workspace {
         let q = Process(); q.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof"); q.arguments = ["-n", "-d", "cwd", "-F", "pn"]
         let pipe = Pipe(); q.standardOutput = pipe; q.standardError = FileHandle.nullDevice
         guard (try? q.run()) != nil else { return [] }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15) { if q.isRunning { q.terminate() } }   // lsof завис — не ждём вечно
         let data = pipe.fileHandleForReading.readDataToEndOfFile()   // до waitUntilExit: вывод больше буфера канала
         q.waitUntilExit()
         let me = getpid()
@@ -644,6 +668,8 @@ final class Workspace {
         let stamp = "\(Int64(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(6).lowercased())"
         let base = workDir.appendingPathComponent(chat, isDirectory: true).appendingPathComponent(stamp, isDirectory: true)
         let root = base.appendingPathComponent(name, isDirectory: true)
+        workLock.lock(); defer { workLock.unlock() }
+        guard !droppedChats.contains(chat) else { throw FsError("Чат удалён") }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         allow(base.path)
         allow(root.path)
@@ -715,6 +741,7 @@ final class Workspace {
     /// Чат удалён — стираем его рабочие копии (вызывает Backend при DELETE /api/chats/<id>)
     func dropChatWork(_ chat: String) {
         guard chat.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else { return }
+        workLock.lock(); droppedChats.insert(chat); workLock.unlock()
         let dir = workDir.appendingPathComponent(chat, isDirectory: true)
         if (try? FileManager.default.destinationOfSymbolicLink(atPath: dir.path)) != nil {
             try? FileManager.default.removeItem(atPath: dir.path)   // ссылку убираем, а не то, куда она ведёт
@@ -724,9 +751,14 @@ final class Workspace {
         forgetTree(dir.resolvingSymlinksInPath().path)
     }
 
-    /// Остановить запущенное в копии, убрать её (и всё внутри) из разрешённых и стереть с диска
+    /// Закрыть доступ к копии (и всему внутри), остановить запущенное в ней и стереть с диска
     private func forgetTree(_ base: String) {
         let inside = { (p: String) -> Bool in p == base || p.hasPrefix(base + "/") }
+        workLock.lock()   // сначала доступ: запись, которая придёт позже, получит отказ
+        foldersLock.lock()
+        allowed = allowed.filter { !inside($0) }
+        foldersLock.unlock()
+        workLock.unlock()
         var procs: [Process] = []
         lock.lock()
         for job in jobs.values where job.p.isRunning && inside(job.root) { job.stopped = true; procs.append(job.p) }
@@ -738,17 +770,18 @@ final class Workspace {
         let left = pidsIn(base).filter { !pids.contains($0) }
         for pid in left { kill(pid, SIGTERM) }
         pids += left
-        let alive = { (pid: Int32) -> Bool in kill(pid, 0) == 0 }
-        let until = Date().addingTimeInterval(3)
-        while (procs.contains(where: { $0.isRunning }) || pids.contains(where: alive)) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
-        // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко; и то, что появилось за это время
-        for p in procs where p.isRunning { stopTree(p, SIGKILL) }
-        for pid in pids where alive(pid) { kill(pid, SIGKILL) }
-        for pid in pidsIn(base) { kill(pid, SIGKILL) }
-        foldersLock.lock()
-        allowed = allowed.filter { $0 != base && !$0.hasPrefix(base + "/") }
-        foldersLock.unlock()
+        if !procs.isEmpty || !pids.isEmpty {   // ничего не работало — ждать нечего
+            let alive = { (pid: Int32) -> Bool in kill(pid, 0) == 0 }
+            let until = Date().addingTimeInterval(3)
+            while (procs.contains(where: { $0.isRunning }) || pids.contains(where: alive)) && Date() < until { Thread.sleep(forTimeInterval: 0.1) }
+            // не остановилось за 3 секунды (не слушает SIGTERM) — жёстко; и то, что появилось за это время
+            for p in procs where p.isRunning { stopTree(p, SIGKILL) }
+            for pid in pids where alive(pid) { kill(pid, SIGKILL) }
+            for pid in pidsIn(base) { kill(pid, SIGKILL) }
+        }
+        workLock.lock()   // запись, которая уже шла, закончилась — теперь стираем
         try? FileManager.default.removeItem(atPath: base)
+        workLock.unlock()
     }
 
     // Заметки модели о проекте — хранятся у приложения, в папку пользователя не пишутся
